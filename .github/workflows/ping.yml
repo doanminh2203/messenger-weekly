@@ -2,7 +2,11 @@ name: call-bot-every-5m
 on:
   schedule:
     - cron: '*/5 * * * *'   # every 5 minutes (UTC)
-  workflow_dispatch:        # allow manual run
+  workflow_dispatch:
+
+concurrency:
+  group: ping-every-5m
+  cancel-in-progress: false
 
 jobs:
   ping:
