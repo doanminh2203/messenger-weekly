@@ -19,6 +19,17 @@ def verify():
         return request.args.get("hub.challenge"), 200
     return "Verification failed", 403
 
+@app.post("/webhook")
+def receive():
+    data = request.get_json(silent=True) or {}
+    app.logger.info(f"RAW: {data}")  # <— thêm dòng này
+    for entry in data.get("entry", []):
+        for evt in entry.get("messaging", []):
+            psid = evt.get("sender", {}).get("id")
+            if psid:
+                app.logger.info(f"PSID: {psid}")
+    return "ok", 200
+
 # 2) Nhận sự kiện tin nhắn (lấy PSID)
 @app.post("/webhook")
 def receive():
