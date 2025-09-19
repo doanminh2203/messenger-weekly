@@ -1,10 +1,11 @@
-import os, datetime as dt, requests
+import os, datetime as dt, requests, json, logging
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 
+# đọc biến môi trường (local có .env; Render dùng Env Vars)
 load_dotenv()
 
-# Dùng getenv để không crash nếu thiếu biến môi trường
+# KHÔNG làm app crash nếu thiếu biến
 PAGE_TOKEN   = os.getenv("PAGE_TOKEN")                 # EAA...
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "changeme")
 CRON_SECRET  = os.getenv("CRON_SECRET", "secret")
@@ -12,29 +13,55 @@ TEST_PSIDS   = [p.strip() for p in os.getenv("TEST_PSIDS","").split(",") if p.st
 
 app = Flask(__name__)
 
-# 1) Verify webhook của Messenger (GET)
+# Bật logging rõ ràng
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
+
+# ---- Health check / root ----
+@app.get("/")
+def root():
+    return "OK", 200
+
+# ---- GET /webhook: verify từ Meta (hub.challenge) ----
 @app.get("/webhook")
-def verify():
+def webhook_verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN:
         return request.args.get("hub.challenge"), 200
     return "Verification failed", 403
 
-# 2) Nhận sự kiện tin nhắn (POST)
+# ---- POST /webhook: nhận event Messenger ----
 @app.post("/webhook")
-def receive():
-    data = request.get_json(silent=True) or {}
-    app.logger.info(f"RAW: {data}")
-    for entry in data.get("entry", []):
-        for evt in entry.get("messaging", []):
-            psid = evt.get("sender", {}).get("id")
-            if psid:
-                app.logger.info(f"PSID: {psid}")
+def webhook_receive():
+    # Log headers + raw body (dù content-type gì)
+    raw = request.get_data(as_text=True)
+    app.logger.info(f"HEADERS: {dict(request.headers)}")
+    app.logger.info(f"RAW BODY: {raw}")
+
+    data = None
+    if request.is_json:
+        data = request.get_json(silent=True)
+    if data is None:
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+
+    # Facebook Page events chuẩn: object == "page" → entry[].messaging[]
+    if isinstance(data, dict) and data.get("object") == "page":
+        for entry in data.get("entry", []):
+            for evt in entry.get("messaging", []):
+                psid = (((evt or {}).get("sender") or {}).get("id"))
+                if psid:
+                    app.logger.info(f"PSID: {psid}")
+        # Bạn có thể xử lý thêm message/postback tại đây
+    else:
+        app.logger.info("Non-messaging or empty payload received")
+
     return "ok", 200
 
-# 3) Gửi tin nhắn
-def send_text(psid, text):
+# ---- Gửi tin nhắn văn bản qua Send API ----
+def send_text(psid: str, text: str):
     if not PAGE_TOKEN:
-        # Không ném exception để app vẫn sống; log cho bạn biết cần set token
         app.logger.error("PAGE_TOKEN is missing; cannot send messages")
         return
     url = "https://graph.facebook.com/v20.0/me/messages"
@@ -46,11 +73,14 @@ def send_text(psid, text):
     )
     r.raise_for_status()
 
-# 4) Cron endpoint (Render gọi hằng tuần)
+# ---- Endpoint để Cron Job gọi hằng tuần ----
 @app.post("/task/weekly")
 def task_weekly():
     if request.headers.get("X-CRON-SECRET") != CRON_SECRET:
         abort(403)
+    if not PAGE_TOKEN:
+        return jsonify({"error": "PAGE_TOKEN is missing"}), 500
+
     today = dt.date.today().strftime("%d/%m/%Y")
     msg = f"Nhắc trả nợ tuần này ({today}). Trả lời 'DỪNG' để hủy."
     sent = 0
@@ -62,9 +92,6 @@ def task_weekly():
             app.logger.exception(f"Send failed for {p}: {e}")
     return jsonify({"sent": sent, "list": TEST_PSIDS})
 
-@app.get("/")
-def root():
-    return "OK", 200
-
 if __name__ == "__main__":
+    # Render cung cấp PORT qua biến môi trường
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
