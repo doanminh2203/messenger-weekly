@@ -15,6 +15,9 @@ jobs:
       - name: Timestamp (UTC)
         run: date -u
 
+      - name: Timestamp (Asia/Ho_Chi_Minh)
+        run: TZ=Asia/Ho_Chi_Minh date
+
       - name: Call /task/weekly
         run: |
           curl -sS -X POST \
