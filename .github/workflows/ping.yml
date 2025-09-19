@@ -1,0 +1,18 @@
+cat > .github/workflows/ping.yml <<'YAML'
+name: call-bot-every-5m
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # chạy mỗi 5 phút (UTC)
+  workflow_dispatch:        # cho phép bấm chạy tay
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /task/weekly
+        run: |
+          curl -sS -X POST \
+            -H "X-CRON-SECRET: ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.APP_URL }}/task/weekly"
+YAML
