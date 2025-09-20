@@ -13,7 +13,8 @@ def _get_ocr():
     global _OCR
     if _OCR is None:
         # det, cls, rec = True để phát hiện + xoay + nhận dạng
-        _OCR = RapidOCR(det=True, cls=True, rec=True)
+        _OCR = RapidOCR()  # dùng cấu hình mặc định, tránh lỗi det_/cls_/rec_
+
     return _OCR
 
 def _fetch_image_bytes(url: str) -> bytes:
