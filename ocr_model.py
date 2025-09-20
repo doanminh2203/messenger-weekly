@@ -185,19 +185,58 @@ def score_match(extracted: Dict[str, Any], expected: Dict[str, Any]) -> Dict[str
 def ocr_extract_text(image_url: str) -> Tuple[str, List[Tuple[str, float]]]:
     """
     Chạy RapidOCR trên ảnh URL, trả (full_text, items[text/conf]).
-    RapidOCR trả: (boxes, texts, scores)
+    Hỗ trợ cả 2 kiểu output của RapidOCR:
+      - (result, elapse) với result là list[[box, text, score], ...]
+      - (boxes, texts, scores)
     """
     ocr = _get_ocr()
     img_bytes = _fetch_image_bytes(image_url)
+
     import numpy as np, cv2
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    boxes, texts, scores = ocr(img)
-    lines = texts or []
+    out = ocr(img)
+
+    lines: List[str] = []
+    confs: List[float] = []
+
+    # Kiểu 1: (result, elapse) -> result: list[[box, text, score], ...]
+    if isinstance(out, tuple) and len(out) == 2:
+        result, _ = out
+        if isinstance(result, list) and result:
+            # mỗi phần tử: [box, text, score]
+            for item in result:
+                # Phòng trường hợp lib thay đổi cấu trúc
+                if isinstance(item, (list, tuple)) and len(item) >= 3:
+                    text = str(item[1]) if item[1] is not None else ""
+                    score = float(item[2]) if item[2] is not None else 0.0
+                    if text:
+                        lines.append(text)
+                        confs.append(score)
+                # nếu chỉ có box (det-only) thì bỏ qua
+        # else: không đọc được gì
+
+    # Kiểu 2: (boxes, texts, scores)
+    elif isinstance(out, tuple) and len(out) == 3:
+        boxes, texts, scores = out
+        if texts:
+            lines = [str(t) for t in texts]
+            # scores có thể là None hoặc list; normalize về float
+            if scores:
+                confs = [float(s) if s is not None else 0.0 for s in scores]
+            else:
+                confs = [0.0] * len(lines)
+
+    # Trường hợp khác: không đúng kiểu kỳ vọng
+    else:
+        # fallback: không có text
+        lines, confs = [], []
+
     full_text = "\n".join(lines)
-    items = list(zip(lines, [float(s) for s in (scores or [])]))
+    items = list(zip(lines, confs))
     return full_text, items
+
 
 def verify_image_against_expected(image_url: str, expected: Dict[str, Any]) -> Dict[str, Any]:
     full_text, items = ocr_extract_text(image_url)
