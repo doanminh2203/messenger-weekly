@@ -1,4 +1,4 @@
-# server.py
+# server.py (đã thêm debug Note + xác nhận Người gửi / Số tiền / Ngày giờ)
 import os
 import json
 import time
@@ -252,7 +252,9 @@ def webhook_receive():
                     try:
                         # Có thể truyền expected nếu muốn so khớp; tạm để {}
                         result = verify_image_against_expected(image_url, expected={})
-                        ext = result.get("extracted") or {}
+                        ext  = result.get("extracted")   or {}
+                        conf = result.get("conf_stats")  or {}
+                        raw  = (ext.get("raw_text") or "")[:1000]  # debug cắt 1000 ký tự
 
                         # Trường chính để XÁC NHẬN
                         sender  = ext.get("sender_name") or "-"
@@ -271,7 +273,7 @@ def webhook_receive():
                         else:
                             amt_txt = ext.get("amount_text") or "-"
 
-                        # ==== Tin nhắn xác nhận theo yêu cầu ====
+                        # ==== Tin nhắn xác nhận ====
                         confirm = (
                             "✅ ĐÃ NHẬN BẰNG CHỨNG CHUYỂN KHOẢN\n"
                             f"• Người gửi: {sender}\n"
@@ -282,13 +284,20 @@ def webhook_receive():
                             f"• Mã GD: {txid}\n"
                         )
 
-                        # Gợi ý nếu thiếu trường quan trọng
+                        # Debug note nếu thiếu
                         missing = []
-                        if not sender or sender == "-": missing.append("Người gửi")
-                        if not amt and not ext.get("amount_text"): missing.append("Số tiền")
-                        if not when or when == "-": missing.append("Ngày/giờ")
+                        if not ext.get("sender_name"): missing.append("Người gửi")
+                        if not ext.get("amount") and not ext.get("amount_text"): missing.append("Số tiền")
+                        if not ext.get("datetime_text"): missing.append("Ngày/giờ")
+
                         if missing:
-                            confirm += "\n⚠️ Thiếu: " + ", ".join(missing) + ". Vui lòng gửi ảnh rõ hơn."
+                            avg = conf.get("avg")
+                            debug_note = "\n[Debug]"
+                            debug_note += "\n- Thiếu: " + ", ".join(missing)
+                            if avg is not None:
+                                debug_note += f"\n- Độ tin cậy trung bình OCR: {avg:.2f}"
+                            debug_note += "\n- Văn bản OCR (cắt ngắn):\n" + raw
+                            confirm += "\n" + debug_note
 
                         send_text(psid, confirm)
 

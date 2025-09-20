@@ -1,6 +1,6 @@
-# ocr_model.py (bản nhẹ dùng RapidOCR)
+# ocr_model.py (RapidOCR nhẹ + regex mở rộng + fallback)
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from rapidfuzz import fuzz
 import requests
 
@@ -10,11 +10,10 @@ from rapidocr_onnxruntime import RapidOCR
 _OCR = None
 
 def _get_ocr():
+    """Khởi tạo RapidOCR với cấu hình mặc định (tránh lỗi det_/cls_/rec_)."""
     global _OCR
     if _OCR is None:
-        # det, cls, rec = True để phát hiện + xoay + nhận dạng
-        _OCR = RapidOCR()  # dùng cấu hình mặc định, tránh lỗi det_/cls_/rec_
-
+        _OCR = RapidOCR()  # KHÔNG truyền det/cls/rec
     return _OCR
 
 def _fetch_image_bytes(url: str) -> bytes:
@@ -22,75 +21,115 @@ def _fetch_image_bytes(url: str) -> bytes:
     r.raise_for_status()
     return r.content
 
-def _vn_to_int_amount(s: str) -> int | None:
-    if not s: return None
+def _vn_to_int_amount(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
     x = s.strip().upper()
-    x = x.replace("VND", "").replace("VNĐ", "").replace("Đ", "").replace("D","")
+    x = x.replace("VND", "").replace("VNĐ", "").replace("Đ", "").replace("D", "")
     x = x.replace(".", "").replace(",", "")
     x = re.sub(r"[^0-9]", "", x)
-    if not x: return None
-    try: return int(x)
-    except: return None
+    if not x:
+        return None
+    try:
+        return int(x)
+    except:
+        return None
 
-def _pick_first(patterns: List[str], text: str) -> str | None:
+def _pick_first(patterns: List[str], text: str) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
         if m:
             return (m.group(1) or m.group(0)).strip() if m.groups() else m.group(0).strip()
     return None
 
+def _largest_number_as_amount(text: str) -> Optional[int]:
+    """Fallback: tìm số có độ dài lớn trong toàn văn, coi như số tiền (rủi ro, để cuối)."""
+    cands = re.findall(r"\b\d[\d\.\, ]{4,}\b", text)
+    best = 0
+    for c in cands:
+        v = _vn_to_int_amount(c)
+        if v and v > best:
+            best = v
+    return best or None
+
 def parse_fields(full_text: str) -> Dict[str, Any]:
     """Tách các trường phổ biến trên bill chuyển khoản VN từ full OCR text."""
+    # Chuẩn hóa khoảng trắng để regex ổn định hơn
     text = re.sub(r"[ \t]+", " ", full_text)
+    text_noaccent_upper = (
+        text.upper()
+        .replace("Ầ","A").replace("Ằ","A").replace("Ắ","A").replace("Ẳ","A").replace("Ẵ","A").replace("Ặ","A")
+        .replace("À","A").replace("Á","A").replace("Ả","A").replace("Ã","A").replace("Ạ","A")
+        .replace("Â","A").replace("Ă","A")
+        .replace("È","E").replace("É","E").replace("Ẻ","E").replace("Ẽ","E").replace("Ẹ","E")
+        .replace("Ê","E")
+        .replace("Ì","I").replace("Í","I").replace("Ỉ","I").replace("Ĩ","I").replace("Ị","I")
+        .replace("Ò","O").replace("Ó","O").replace("Ỏ","O").replace("Õ","O").replace("Ọ","O")
+        .replace("Ô","O").replace("Ơ","O")
+        .replace("Ù","U").replace("Ú","U").replace("Ủ","U").replace("Ũ","U").replace("Ụ","U")
+        .replace("Ư","U")
+        .replace("Ỳ","Y").replace("Ý","Y").replace("Ỷ","Y").replace("Ỹ","Y").replace("Ỵ","Y")
+        .replace("Đ","D")
+    )
 
-    # Số tiền
+    # ===== SỐ TIỀN =====
     amt = _pick_first([
         r"Số tiền[:\s]*([0-9\.\, ]+(?:VND|VNĐ|Đ|D)?)",
         r"Amount[:\s]*([0-9\.\, ]+(?:VND|VNĐ|Đ|D)?)",
+        r"(?:SO\s*TIEN|AMOUNT)[:\s]*([0-9\.\, ]+(?:VND|VNĐ|Đ|D)?)",
         r"([0-9][0-9\.\, ]{3,}VND)",
         r"([0-9][0-9\.\, ]{3,}\s?(?:VNĐ|Đ|D))",
     ], text)
     amt_int = _vn_to_int_amount(amt) if amt else None
+    if amt_int is None:
+        # Fallback: lấy số lớn nhất trong toàn văn
+        amt_int = _largest_number_as_amount(text)
 
-    # STK nhận
+    # ===== STK NHẬN =====
     acc_to = _pick_first([
         r"(?:STK|Số\s*tài\s*khoản|Account\s*No\.?)[:\s]*([0-9\- ]{6,})",
-        r"(?:Tài\s*khoản\s*nhận)[:\s]*([0-9\- ]{6,})",
+        r"(?:Tài\s*khoản\s*nhận|ACC\s*TO)[:\s]*([0-9\- ]{6,})",
         r"(?:Account\s*to)[:\s]*([0-9\- ]{6,})",
     ], text)
     acc_to = acc_to.replace(" ", "").replace("-", "") if acc_to else None
 
-    # Tên người nhận
+    # ===== TÊN NGƯỜI NHẬN =====
     name_to = _pick_first([
         r"(?:Tên\s*người\s*nhận|Người\s*nhận|Beneficiary\s*Name)[:\s]*([A-Za-zÀ-ỹ\s\.\-]{3,})",
-        r"(?:Chủ\s*tài\s*khoản\s*nhận)[:\s]*([A-Za-zÀ-ỹ\s\.\-]{3,})",
-        r"(?:To\s*Name)[:\s]*([A-Za-zÀ-ỹ\s\.\-]{3,})",
+        r"(?:CHU\s*TK\s*NHAN|TO\s*NAME)[:\s]*([A-Z\s\.\-]{3,})",
     ], text)
 
-    # Người gửi (NEW)
+    # ===== NGƯỜI GỬI =====
     name_from = _pick_first([
         r"(?:Người\s*gửi|Tên\s*người\s*gửi|Chủ\s*tài\s*khoản\s*gửi|Sender|Payer|From\s*Name)[:\s]*([A-Za-zÀ-ỹ\s\.\-]{3,})",
+        r"(?:NGUOI\s*CHUYEN|NGUOI\s*GUI|FROM\s*NAME)[:\s]*([A-Z\s\.\-]{3,})",
     ], text)
+    if not name_from:
+        m = re.search(r"(?:FROM|NGUOI\s*CHUYEN|PAYER)[:\s]*([A-ZÀ-Ỵ\s\.\-]{3,})", text_noaccent_upper, re.I)
+        if m:
+            name_from = m.group(1).strip()
 
-    # STK gửi (NEW)
+    # ===== STK GỬI =====
     acc_from = _pick_first([
         r"(?:STK\s*nguồn|Tài\s*khoản\s*gửi|From\s*Account|Account\s*from)[:\s]*([0-9\- ]{6,})",
+        r"(?:SO\s*TK\s*GUI|ACC\s*FROM)[:\s]*([0-9\- ]{6,})",
     ], text)
     acc_from = acc_from.replace(" ", "").replace("-", "") if acc_from else None
 
-    # Nội dung
+    # ===== NỘI DUNG =====
     memo = _pick_first([
-        r"(?:Nội\s*dung|Ghi\s*chú|Content|Description)[:\s]*([^\n]+)",
+        r"(?:Nội\s*dung|Ghi\s*chú|Content|Description|ND\s*chuyển|NOI\s*DUNG)[:\s]*([^\n]+)",
     ], text)
 
-    # Thời gian
+    # ===== THỜI GIAN =====
     when = _pick_first([
         r"(?:Thời\s*gian|Ngày\s*giao\s*dịch|Time|Date)[:\s]*([0-9\/\-\:\s]{8,20})",
+        r"(?:NGAY|TIME|DATE)[:\s]*([0-9\/\-\:\s]{8,20})",
         r"(\d{1,2}\/\d{1,2}\/\d{2,4}\s+\d{1,2}:\d{2})",
         r"(\d{4}\-\d{1,2}\-\d{1,2}\s+\d{1,2}:\d{2})",
     ], text)
 
-    # Mã GD
+    # ===== MÃ GIAO DỊCH =====
     tx = _pick_first([
         r"(?:Mã\s*giao\s*dịch|Transaction\s*ID|Ref(?:erence)?)[:\s]*([A-Za-z0-9\-]{6,})",
     ], text)
@@ -104,9 +143,9 @@ def parse_fields(full_text: str) -> Dict[str, Any]:
         "sender_account": acc_from,
 
         "receiver_name": name_to.strip() if name_to else None,
-        "account_number": acc_to,   # alias: tài khoản nhận
+        "account_number": acc_to,   # tài khoản nhận
 
-        "memo": memo,
+        "memo": memo.strip() if memo else None,
         "datetime_text": when,
         "tx_code": tx
     }
@@ -128,7 +167,6 @@ def score_match(extracted: Dict[str, Any], expected: Dict[str, Any]) -> Dict[str
 
     exp_name = expected.get("name")
     if exp_name:
-        # so với tên người nhận
         ex_name = (extracted.get("receiver_name") or "")
         report["checks"]["name"] = float(fuzz.token_set_ratio(exp_name.upper(), ex_name.upper()))
 
