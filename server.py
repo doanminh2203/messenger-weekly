@@ -7,37 +7,43 @@ import logging
 import datetime as dt
 from io import StringIO
 import csv
+
 import requests
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
-from ocr_model import verify_image_against_expected  # OCR model tách riêng
+from ocr_model import verify_image_against_expected  # RapidOCR (onnx) nhẹ
 
-# ====== ENV ======
+# ================== ENV ==================
 load_dotenv()  # local .env; Render dùng Env Vars
 
-PAGE_TOKEN    = os.getenv("PAGE_TOKEN")                 # EAA... (Page access token)
+# Facebook
+PAGE_TOKEN    = os.getenv("PAGE_TOKEN")                 # EAA... (Page Access Token)
 VERIFY_TOKEN  = os.getenv("VERIFY_TOKEN", "changeme")
+
+# Cron bảo vệ
 CRON_SECRET   = os.getenv("CRON_SECRET", "secret")
+
+# Danh sách test thủ công (fallback)
 TEST_PSIDS    = [p.strip() for p in os.getenv("TEST_PSIDS", "").split(",") if p.strip()]
 
-# ĐỌC CSV (raw URL public): ví dụ https://raw.githubusercontent.com/<owner>/<repo>/main/psids.csv
-PSIDS_CSV_URL = os.getenv("PSIDS_CSV_URL", "")
+# Đọc CSV công khai (raw URL)
+PSIDS_CSV_URL = os.getenv("PSIDS_CSV_URL", "")         # vd: https://raw.githubusercontent.com/<owner>/<repo>/main/psids.csv
 
-# GHI CSV (commit trực tiếp qua GitHub API)
+# Ghi CSV qua GitHub API (commit trực tiếp)
 GH_OWNER      = os.getenv("GH_OWNER", "")
 GH_REPO       = os.getenv("GH_REPO", "")
 GH_BRANCH     = os.getenv("GH_BRANCH", "main")
-GH_FILE_PATH  = os.getenv("GH_FILE_PATH", "psids.csv")  # đường dẫn file trong repo
-GH_TOKEN      = os.getenv("GH_TOKEN", "")               # token có quyền Contents: RW
+GH_FILE_PATH  = os.getenv("GH_FILE_PATH", "psids.csv")
+GH_TOKEN      = os.getenv("GH_TOKEN", "")              # token RW Contents cho repo trên
 
-# ====== APP & LOG ======
+# ================== APP & LOG ==================
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-# ====== HELPERS: FACEBOOK SEND API ======
+# ================== HELPERS: FACEBOOK SEND API ==================
 def send_text(psid: str, text: str):
     """Gửi tin nhắn văn bản tới 1 PSID bằng Send API."""
     if not PAGE_TOKEN:
@@ -54,7 +60,7 @@ def send_text(psid: str, text: str):
         app.logger.error("Send API error %s: %s", r.status_code, r.text)
     r.raise_for_status()
 
-# ====== HELPERS: CSV - ĐỌC NGƯỜI NHẬN ======
+# ================== HELPERS: CSV - ĐỌC NGƯỜI NHẬN ==================
 def load_psids_from_csv():
     """Đọc tất cả PSID từ CSV public (raw URL). Trả [] nếu không cấu hình hoặc lỗi."""
     targets = []
@@ -73,10 +79,10 @@ def load_psids_from_csv():
         app.logger.exception(f"Failed to load CSV (read): {e}")
     return targets
 
-# ====== HELPERS: GITHUB CONTENTS API - GHI CSV ======
+# ================== HELPERS: GITHUB CONTENTS API - GHI CSV ==================
 GITHUB_API = "https://api.github.com"
 
-def gh_headers():
+def _gh_headers():
     if not GH_TOKEN:
         raise RuntimeError("GH_TOKEN missing")
     return {
@@ -87,7 +93,7 @@ def gh_headers():
 def gh_get_file(owner, repo, path, branch):
     """GET /repos/{owner}/{repo}/contents/{path}?ref={branch}"""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
-    r = requests.get(url, headers=gh_headers(), params={"ref": branch}, timeout=20)
+    r = requests.get(url, headers=_gh_headers(), params={"ref": branch}, timeout=20)
     if r.status_code == 404:
         return None  # file chưa tồn tại
     r.raise_for_status()
@@ -103,7 +109,7 @@ def gh_put_file(owner, repo, path, branch, content_bytes, sha=None, message="upd
     }
     if sha:
         payload["sha"] = sha
-    r = requests.put(url, headers=gh_headers(), json=payload, timeout=30)
+    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=30)
     if r.status_code >= 400:
         app.logger.error("GitHub PUT error %s: %s", r.status_code, r.text)
     r.raise_for_status()
@@ -164,7 +170,7 @@ def upsert_psid_to_csv(psid: str) -> bool:
         app.logger.exception(f"Failed to upsert CSV: {e}")
         return False
 
-# ====== HELPERS: WEBHOOK PARSE ======
+# ================== HELPERS: WEBHOOK PARSE ==================
 def extract_ref(evt: dict):
     """Lấy ref nếu user vào từ m.me?ref=... (tham khảo)."""
     if (evt.get("referral") or {}).get("ref"):
@@ -175,19 +181,19 @@ def extract_ref(evt: dict):
         return evt["postback"]["referral"]["ref"]
     return None
 
-# ====== ROUTES ======
+# ================== ROUTES ==================
 @app.get("/")
 def root():
     return "OK", 200
 
-# Verify webhook
+# 1) Verify webhook
 @app.get("/webhook")
 def webhook_verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN:
         return request.args.get("hub.challenge"), 200
     return "Verification failed", 403
 
-# Receive events
+# 2) Nhận sự kiện từ Messenger
 @app.post("/webhook")
 def webhook_receive():
     raw = request.get_data(as_text=True) or ""
@@ -234,7 +240,7 @@ def webhook_receive():
                     except Exception as e:
                         app.logger.exception(f"Reply failed: {e}")
 
-            # Attachments: nếu là ảnh → OCR
+            # Attachments: nếu là ảnh → OCR & GỬI XÁC NHẬN (Người gửi / Số tiền / Ngày giờ)
             attachments = msg.get("attachments") or []
             for att in attachments:
                 if (att.get("type") or "").lower() == "image":
@@ -244,27 +250,48 @@ def webhook_receive():
                         continue
                     app.logger.info(f"OCR image_url: {image_url}")
                     try:
-                        # (Tuỳ chọn) có thể parse expected từ text nếu người dùng gửi kèm, tạm để {}
+                        # Có thể truyền expected nếu muốn so khớp; tạm để {}
                         result = verify_image_against_expected(image_url, expected={})
                         ext = result.get("extracted") or {}
-                        amt  = ext.get("amount")
-                        acc  = ext.get("account_number") or "-"
-                        name = ext.get("receiver_name")  or "-"
-                        memo = (ext.get("memo") or "-").strip()
-                        when = ext.get("datetime_text") or "-"
-                        txid = ext.get("tx_code") or "-"
-                        amt_txt = f"{amt:,} VND".replace(",", ".") if isinstance(amt, int) else (ext.get("amount_text") or "-")
-                        summary = (
-                            "📄 Đã nhận ảnh giao dịch và trích xuất:\n"
+
+                        # Trường chính để XÁC NHẬN
+                        sender  = ext.get("sender_name") or "-"
+                        amt     = ext.get("amount")
+                        when    = ext.get("datetime_text") or "-"
+
+                        # Thông tin thêm
+                        acc_from = ext.get("sender_account") or "-"
+                        acc_to   = ext.get("account_number") or "-"
+                        memo     = (ext.get("memo") or "-").strip()
+                        txid     = ext.get("tx_code") or "-"
+
+                        # Format số tiền
+                        if isinstance(amt, int):
+                            amt_txt = f"{amt:,} VND".replace(",", ".")
+                        else:
+                            amt_txt = ext.get("amount_text") or "-"
+
+                        # ==== Tin nhắn xác nhận theo yêu cầu ====
+                        confirm = (
+                            "✅ ĐÃ NHẬN BẰNG CHỨNG CHUYỂN KHOẢN\n"
+                            f"• Người gửi: {sender}\n"
                             f"• Số tiền: {amt_txt}\n"
-                            f"• STK nhận: {acc}\n"
-                            f"• Tên nhận: {name}\n"
+                            f"• Ngày/giờ: {when}\n"
+                            f"• STK gửi → nhận: {acc_from} → {acc_to}\n"
                             f"• Nội dung: {memo}\n"
-                            f"• Thời gian: {when}\n"
-                            f"• Mã GD: {txid}\n\n"
-                            "Nếu thông tin chưa đúng, hãy gửi lại ảnh rõ hơn."
+                            f"• Mã GD: {txid}\n"
                         )
-                        send_text(psid, summary)
+
+                        # Gợi ý nếu thiếu trường quan trọng
+                        missing = []
+                        if not sender or sender == "-": missing.append("Người gửi")
+                        if not amt and not ext.get("amount_text"): missing.append("Số tiền")
+                        if not when or when == "-": missing.append("Ngày/giờ")
+                        if missing:
+                            confirm += "\n⚠️ Thiếu: " + ", ".join(missing) + ". Vui lòng gửi ảnh rõ hơn."
+
+                        send_text(psid, confirm)
+
                     except Exception as e:
                         app.logger.exception(f"OCR failed: {e}")
                         try:
@@ -279,7 +306,7 @@ def webhook_receive():
 
     return "ok", 200
 
-# Cron endpoint – gửi theo CSV/ENV; hỗ trợ psids= & msg=
+# 3) Cron endpoint – gửi theo CSV/ENV; hỗ trợ psids= & msg=
 @app.post("/task/weekly")
 def task_weekly():
     if request.headers.get("X-CRON-SECRET") != CRON_SECRET:
@@ -327,6 +354,6 @@ def task_weekly():
         "server_time_vietnam": now_vn.isoformat(timespec="seconds")
     })
 
-# ====== MAIN ======
+# ================== MAIN ==================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
