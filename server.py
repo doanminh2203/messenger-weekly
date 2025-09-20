@@ -12,6 +12,8 @@ from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+from ocr_model import verify_image_against_expected  # OCR model tách riêng
+
 # ====== ENV ======
 load_dotenv()  # local .env; Render dùng Env Vars
 
@@ -46,7 +48,7 @@ def send_text(psid: str, text: str):
         url,
         params={"access_token": PAGE_TOKEN},
         json={"recipient": {"id": psid}, "message": {"text": text}},
-        timeout=20,
+        timeout=25,
     )
     if r.status_code >= 400:
         app.logger.error("Send API error %s: %s", r.status_code, r.text)
@@ -59,7 +61,7 @@ def load_psids_from_csv():
     if not PSIDS_CSV_URL:
         return targets
     try:
-        resp = requests.get(PSIDS_CSV_URL, timeout=10)
+        resp = requests.get(PSIDS_CSV_URL, timeout=15)
         resp.raise_for_status()
         f = StringIO(resp.text)
         reader = csv.DictReader(f)
@@ -164,7 +166,7 @@ def upsert_psid_to_csv(psid: str) -> bool:
 
 # ====== HELPERS: WEBHOOK PARSE ======
 def extract_ref(evt: dict):
-    """Lấy ref nếu user vào từ m.me?ref=... (tham khảo, không bắt buộc)."""
+    """Lấy ref nếu user vào từ m.me?ref=... (tham khảo)."""
     if (evt.get("referral") or {}).get("ref"):
         return evt["referral"]["ref"]
     if ((evt.get("message") or {}).get("referral") or {}).get("ref"):
@@ -178,14 +180,14 @@ def extract_ref(evt: dict):
 def root():
     return "OK", 200
 
-# 1) Verify webhook
+# Verify webhook
 @app.get("/webhook")
 def webhook_verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN:
         return request.args.get("hub.challenge"), 200
     return "Verification failed", 403
 
-# 2) Receive events (log PSID, xử lý GET_STARTED, message, referral)
+# Receive events
 @app.post("/webhook")
 def webhook_receive():
     raw = request.get_data(as_text=True) or ""
@@ -205,7 +207,7 @@ def webhook_receive():
             if psid:
                 app.logger.info(f"PSID: {psid}")
 
-            # postback GET_STARTED
+            # Postback GET_STARTED
             postback = (evt.get("postback") or {})
             payload = (postback.get("payload") or "")
             if psid and payload == "GET_STARTED":
@@ -215,32 +217,69 @@ def webhook_receive():
                     send_text(
                         psid,
                         "Chào bạn! Bạn đã bắt đầu trò chuyện với 108Lab.\n"
-                        "Bạn sẽ nhận nhắc hằng tuần khi được bật. Nhắn 'DỪNG' để hủy bất cứ lúc nào."
+                        "Bạn sẽ nhận nhắc hằng tuần khi được bật. Nhắn 'DỪNG' để hủy."
                     )
                 except Exception as e:
                     app.logger.exception(f"Reply failed: {e}")
 
-            # nếu user gửi text: cũng lưu PSID (idempotent)
+            # Message (text + attachments)
             msg = (evt.get("message") or {})
-            if psid and msg.get("text"):
+            text = (msg.get("text") or "").strip()
+            if psid and text:
                 upsert_psid_to_csv(psid)
-                text = (msg.get("text") or "").strip()
                 app.logger.info(f"MSG from {psid}: {text!r}")
-                # hỗ trợ người dùng hủy nhận
                 if text.upper() == "DỪNG":
                     try:
                         send_text(psid, "Bạn đã hủy nhận nhắc. Nhắn 'BẮT ĐẦU' để bật lại.")
                     except Exception as e:
                         app.logger.exception(f"Reply failed: {e}")
 
-            # tham khảo: ref
+            # Attachments: nếu là ảnh → OCR
+            attachments = msg.get("attachments") or []
+            for att in attachments:
+                if (att.get("type") or "").lower() == "image":
+                    payload = att.get("payload") or {}
+                    image_url = payload.get("url")
+                    if not image_url:
+                        continue
+                    app.logger.info(f"OCR image_url: {image_url}")
+                    try:
+                        # (Tuỳ chọn) có thể parse expected từ text nếu người dùng gửi kèm, tạm để {}
+                        result = verify_image_against_expected(image_url, expected={})
+                        ext = result.get("extracted") or {}
+                        amt  = ext.get("amount")
+                        acc  = ext.get("account_number") or "-"
+                        name = ext.get("receiver_name")  or "-"
+                        memo = (ext.get("memo") or "-").strip()
+                        when = ext.get("datetime_text") or "-"
+                        txid = ext.get("tx_code") or "-"
+                        amt_txt = f"{amt:,} VND".replace(",", ".") if isinstance(amt, int) else (ext.get("amount_text") or "-")
+                        summary = (
+                            "📄 Đã nhận ảnh giao dịch và trích xuất:\n"
+                            f"• Số tiền: {amt_txt}\n"
+                            f"• STK nhận: {acc}\n"
+                            f"• Tên nhận: {name}\n"
+                            f"• Nội dung: {memo}\n"
+                            f"• Thời gian: {when}\n"
+                            f"• Mã GD: {txid}\n\n"
+                            "Nếu thông tin chưa đúng, hãy gửi lại ảnh rõ hơn."
+                        )
+                        send_text(psid, summary)
+                    except Exception as e:
+                        app.logger.exception(f"OCR failed: {e}")
+                        try:
+                            send_text(psid, "⚠️ Xin lỗi, chưa đọc được ảnh. Vui lòng gửi lại ảnh rõ nét hơn.")
+                        except:
+                            pass
+
+            # Referral (tham khảo)
             ref = extract_ref(evt)
             if psid and ref:
                 app.logger.info(f"REF '{ref}' from {psid}")
 
     return "ok", 200
 
-# 3) Cron endpoint – gửi cho 1 nhóm duy nhất (CSV hoặc TEST_PSIDS); hỗ trợ psids= & msg=
+# Cron endpoint – gửi theo CSV/ENV; hỗ trợ psids= & msg=
 @app.post("/task/weekly")
 def task_weekly():
     if request.headers.get("X-CRON-SECRET") != CRON_SECRET:
@@ -275,7 +314,7 @@ def task_weekly():
         except Exception as e:
             app.logger.exception(f"Send failed for {p}: {e}")
 
-    # Timestamp UTC + VN cho dễ đối chiếu log
+    # Timestamp UTC + VN
     now_utc = dt.datetime.now(dt.timezone.utc)
     vn_tz   = ZoneInfo("Asia/Ho_Chi_Minh")
     now_vn  = now_utc.astimezone(vn_tz)
