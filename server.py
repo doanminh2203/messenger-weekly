@@ -1,4 +1,4 @@
-# server.py (đã thêm debug Note + xác nhận Người gửi / Số tiền / Ngày giờ)
+# server.py
 import os
 import json
 import time
@@ -7,43 +7,37 @@ import logging
 import datetime as dt
 from io import StringIO
 import csv
+from typing import List, Dict, Optional
 
 import requests
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
-from ocr_model import verify_image_against_expected  # RapidOCR (onnx) nhẹ
+# === OCR nhanh (Amount/Date ≤30s) ===
+from ocr_fast import fast_extract_amount_date
 
 # ================== ENV ==================
-load_dotenv()  # local .env; Render dùng Env Vars
+load_dotenv()  # local dùng .env; Render dùng Env Vars
 
-# Facebook
-PAGE_TOKEN    = os.getenv("PAGE_TOKEN")                 # EAA... (Page Access Token)
-VERIFY_TOKEN  = os.getenv("VERIFY_TOKEN", "changeme")
+PAGE_TOKEN      = os.getenv("PAGE_TOKEN")                  # EAA...
+VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "changeme")
+CRON_SECRET     = os.getenv("CRON_SECRET", "secret")
+TEST_PSIDS      = [p.strip() for p in os.getenv("TEST_PSIDS", "").split(",") if p.strip()]
+PSIDS_CSV_URL   = os.getenv("PSIDS_CSV_URL", "")           # raw URL tới psids.csv (đọc)
+# Ghi CSV qua GitHub API:
+GH_OWNER        = os.getenv("GH_OWNER", "")
+GH_REPO         = os.getenv("GH_REPO", "")
+GH_BRANCH       = os.getenv("GH_BRANCH", "main")
+GH_FILE_PATH    = os.getenv("GH_FILE_PATH", "psids.csv")
+GH_TOKEN        = os.getenv("GH_TOKEN", "")                # token có quyền Contents: Read & write
 
-# Cron bảo vệ
-CRON_SECRET   = os.getenv("CRON_SECRET", "secret")
-
-# Danh sách test thủ công (fallback)
-TEST_PSIDS    = [p.strip() for p in os.getenv("TEST_PSIDS", "").split(",") if p.strip()]
-
-# Đọc CSV công khai (raw URL)
-PSIDS_CSV_URL = os.getenv("PSIDS_CSV_URL", "")         # vd: https://raw.githubusercontent.com/<owner>/<repo>/main/psids.csv
-
-# Ghi CSV qua GitHub API (commit trực tiếp)
-GH_OWNER      = os.getenv("GH_OWNER", "")
-GH_REPO       = os.getenv("GH_REPO", "")
-GH_BRANCH     = os.getenv("GH_BRANCH", "main")
-GH_FILE_PATH  = os.getenv("GH_FILE_PATH", "psids.csv")
-GH_TOKEN      = os.getenv("GH_TOKEN", "")              # token RW Contents cho repo trên
-
-# ================== APP & LOG ==================
+# ================ APP & LOG ================
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-# ================== HELPERS: FACEBOOK SEND API ==================
+# ================ HELPERS: Facebook ================
 def send_text(psid: str, text: str):
     """Gửi tin nhắn văn bản tới 1 PSID bằng Send API."""
     if not PAGE_TOKEN:
@@ -54,20 +48,20 @@ def send_text(psid: str, text: str):
         url,
         params={"access_token": PAGE_TOKEN},
         json={"recipient": {"id": psid}, "message": {"text": text}},
-        timeout=25,
+        timeout=20,
     )
     if r.status_code >= 400:
         app.logger.error("Send API error %s: %s", r.status_code, r.text)
     r.raise_for_status()
 
-# ================== HELPERS: CSV - ĐỌC NGƯỜI NHẬN ==================
-def load_psids_from_csv():
-    """Đọc tất cả PSID từ CSV public (raw URL). Trả [] nếu không cấu hình hoặc lỗi."""
-    targets = []
+# ================ HELPERS: CSV đọc (public raw) ================
+def load_psids_from_csv_public() -> List[str]:
+    """Đọc PSID từ PSIDS_CSV_URL (raw Github). Bỏ dòng header/blank."""
+    targets: List[str] = []
     if not PSIDS_CSV_URL:
         return targets
     try:
-        resp = requests.get(PSIDS_CSV_URL, timeout=15)
+        resp = requests.get(PSIDS_CSV_URL, timeout=10)
         resp.raise_for_status()
         f = StringIO(resp.text)
         reader = csv.DictReader(f)
@@ -79,100 +73,105 @@ def load_psids_from_csv():
         app.logger.exception(f"Failed to load CSV (read): {e}")
     return targets
 
-# ================== HELPERS: GITHUB CONTENTS API - GHI CSV ==================
-GITHUB_API = "https://api.github.com"
-
-def _gh_headers():
+# ================ HELPERS: GitHub Contents API (đọc/ghi CSV) ================
+def _gh_headers() -> Dict[str, str]:
     if not GH_TOKEN:
-        raise RuntimeError("GH_TOKEN missing")
+        raise RuntimeError("GH_TOKEN is missing")
     return {
         "Authorization": f"Bearer {GH_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
 
-def gh_get_file(owner, repo, path, branch):
-    """GET /repos/{owner}/{repo}/contents/{path}?ref={branch}"""
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
-    r = requests.get(url, headers=_gh_headers(), params={"ref": branch}, timeout=20)
+def gh_get_file_info(owner: str, repo: str, path: str, ref: str) -> Dict:
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    r = requests.get(url, headers=_gh_headers(), params={"ref": ref}, timeout=15)
     if r.status_code == 404:
-        return None  # file chưa tồn tại
+        return {"not_found": True}
     r.raise_for_status()
-    return r.json()  # có 'content'(base64), 'sha'
+    return r.json()
 
-def gh_put_file(owner, repo, path, branch, content_bytes, sha=None, message="update psids.csv"):
-    """PUT /repos/{owner}/{repo}/contents/{path} để tạo/cập nhật file"""
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
-    payload = {
-        "message": message,
-        "content": base64.b64encode(content_bytes).decode("utf-8"),
-        "branch": branch,
-    }
+def gh_put_file(owner: str, repo: str, path: str, content_b64: str, message: str, sha: Optional[str], branch: str):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    body = {"message": message, "content": content_b64, "branch": branch}
     if sha:
-        payload["sha"] = sha
-    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=30)
+        body["sha"] = sha
+    r = requests.put(url, headers=_gh_headers(), json=body, timeout=20)
     if r.status_code >= 400:
         app.logger.error("GitHub PUT error %s: %s", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 
-def upsert_psid_to_csv(psid: str) -> bool:
+def gh_read_csv_targets(owner: str, repo: str, path: str, ref: str) -> Dict[str, Dict]:
     """
-    Đọc GH_FILE_PATH; nếu psid chưa có thì append 1 dòng và commit qua GitHub API.
-    Trả True nếu có thêm mới, False nếu đã tồn tại hoặc không đủ ENV.
+    Trả: dict[psid] = {"psid":..., "created_at_iso":...}
+    Nếu file chưa tồn tại -> trả dict rỗng.
     """
-    if not (GH_OWNER and GH_REPO and GH_FILE_PATH and GH_BRANCH and GH_TOKEN):
-        app.logger.warning("GitHub ENV missing; skip CSV upsert")
-        return False
+    info = gh_get_file_info(owner, repo, path, ref)
+    if info.get("not_found"):
+        return {}
+    if info.get("encoding") == "base64" and "content" in info:
+        raw = base64.b64decode(info["content"]).decode("utf-8", errors="ignore")
+    else:
+        # fallback: tải qua download_url
+        dl = info.get("download_url")
+        if not dl:
+            return {}
+        r = requests.get(dl, timeout=12)
+        r.raise_for_status()
+        raw = r.text
 
+    out: Dict[str, Dict] = {}
     try:
-        meta = gh_get_file(GH_OWNER, GH_REPO, GH_FILE_PATH, GH_BRANCH)
-        if meta and "content" in meta:
-            raw = base64.b64decode(meta["content"])
-            text = raw.decode("utf-8", errors="ignore")
-            lines = [ln.rstrip("\n") for ln in text.splitlines()]
-            # đảm bảo có header
-            if not lines or not lines[0].lower().startswith("psid"):
-                lines.insert(0, "psid,created_at_iso")
-            # kiểm tra tồn tại
-            existing = set()
-            for ln in lines[1:]:
-                if not ln:
-                    continue
-                first = ln.split(",", 1)[0].strip()
-                if first:
-                    existing.add(first)
-            if psid in existing:
-                app.logger.info(f"PSID already in CSV: {psid}")
-                return False
-            # append
-            now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-            lines.append(f"{psid},{now_iso}")
-            new_text = "\n".join(lines) + "\n"
-            gh_put_file(
-                GH_OWNER, GH_REPO, GH_FILE_PATH, GH_BRANCH,
-                new_text.encode("utf-8"), sha=meta.get("sha"),
-                message=f"chore: add psid {psid}"
-            )
-            app.logger.info(f"Appended PSID to CSV: {psid}")
-            return True
-        else:
-            # File chưa tồn tại → tạo mới với header + dòng đầu
-            now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-            new_text = "psid,created_at_iso\n" + f"{psid},{now_iso}\n"
-            gh_put_file(
-                GH_OWNER, GH_REPO, GH_FILE_PATH, GH_BRANCH,
-                new_text.encode("utf-8"), sha=None,
-                message=f"chore: create csv with psid {psid}"
-            )
-            app.logger.info(f"Created CSV and added PSID: {psid}")
-            return True
+        f = StringIO(raw)
+        reader = csv.DictReader(f)
+        for row in reader:
+            psid = (row.get("psid") or "").strip()
+            created = (row.get("created_at_iso") or "").strip()
+            if psid:
+                out[psid] = {"psid": psid, "created_at_iso": created}
     except Exception as e:
-        app.logger.exception(f"Failed to upsert CSV: {e}")
+        app.logger.exception(f"Parse CSV error: {e}")
+    # append info.sha để update
+    if "sha" in info:
+        out["_sha"] = info["sha"]
+    return out
+
+def gh_upsert_psid(psid: str) -> bool:
+    """Thêm PSID vào CSV nếu chưa có. Tạo file nếu chưa tồn tại."""
+    if not (GH_OWNER and GH_REPO and GH_FILE_PATH and GH_BRANCH and GH_TOKEN):
+        app.logger.info("GH_* env missing; skip writing PSID to GitHub.")
         return False
 
-# ================== HELPERS: WEBHOOK PARSE ==================
-def extract_ref(evt: dict):
-    """Lấy ref nếu user vào từ m.me?ref=... (tham khảo)."""
+    # đọc hiện trạng
+    exists = gh_read_csv_targets(GH_OWNER, GH_REPO, GH_FILE_PATH, GH_BRANCH)
+    sha = exists.get("_sha")
+    targets = {k: v for k, v in exists.items() if not k.startswith("_")}
+
+    if psid in targets:
+        app.logger.info(f"PSID {psid} already in CSV")
+        return True
+
+    # build CSV mới
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    targets[psid] = {"psid": psid, "created_at_iso": now_iso}
+
+    # luôn có header
+    rows = sorted(targets.values(), key=lambda x: x["created_at_iso"])
+    out_io = StringIO()
+    writer = csv.DictWriter(out_io, fieldnames=["psid", "created_at_iso"])
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    new_b64 = base64.b64encode(out_io.getvalue().encode("utf-8")).decode("ascii")
+
+    # ghi lại
+    msg = f"chore(csv): upsert psid {psid}"
+    gh_put_file(GH_OWNER, GH_REPO, GH_FILE_PATH, new_b64, msg, sha, GH_BRANCH)
+    app.logger.info(f"Appended PSID {psid} to {GH_FILE_PATH}")
+    return True
+
+# ================ MISC ================
+def extract_ref(evt: dict) -> Optional[str]:
     if (evt.get("referral") or {}).get("ref"):
         return evt["referral"]["ref"]
     if ((evt.get("message") or {}).get("referral") or {}).get("ref"):
@@ -193,16 +192,22 @@ def webhook_verify():
         return request.args.get("hub.challenge"), 200
     return "Verification failed", 403
 
-# 2) Nhận sự kiện từ Messenger
+# 2) Receive events
 @app.post("/webhook")
 def webhook_receive():
-    raw = request.get_data(as_text=True) or ""
-    if len(raw) > 4000:
-        app.logger.info(f"RAW BODY (truncated 4k): {raw[:4000]}...")
-    else:
-        app.logger.info(f"RAW BODY: {raw}")
+    raw = request.get_data(as_text=True)
+    app.logger.info(f"HEADERS: {dict(request.headers)}")
+    app.logger.info(f"RAW BODY: {raw}")
 
-    data = request.get_json(silent=True)
+    data = None
+    if request.is_json:
+        data = request.get_json(silent=True)
+    if data is None:
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+
     if not isinstance(data, dict) or data.get("object") != "page":
         app.logger.info("Non-messaging or empty payload received")
         return "ok", 200
@@ -213,34 +218,41 @@ def webhook_receive():
             if psid:
                 app.logger.info(f"PSID: {psid}")
 
-            # Postback GET_STARTED
+            # Lưu PSID ngay khi có bất kỳ tương tác
+            try:
+                gh_upsert_psid(psid)
+            except Exception as e:
+                app.logger.exception(f"upsert psid failed: {e}")
+
+            # GET_STARTED postback
             postback = (evt.get("postback") or {})
             payload = (postback.get("payload") or "")
             if psid and payload == "GET_STARTED":
-                app.logger.info(f"GET_STARTED from {psid}")
-                upsert_psid_to_csv(psid)
                 try:
-                    send_text(
-                        psid,
+                    send_text(psid,
                         "Chào bạn! Bạn đã bắt đầu trò chuyện với 108Lab.\n"
-                        "Bạn sẽ nhận nhắc hằng tuần khi được bật. Nhắn 'DỪNG' để hủy."
+                        "Bạn sẽ nhận nhắc hằng tuần khi được bật. Nhắn 'DỪNG' để hủy bất cứ lúc nào."
                     )
                 except Exception as e:
                     app.logger.exception(f"Reply failed: {e}")
 
-            # Message (text + attachments)
-            msg = (evt.get("message") or {})
+            # Message text: cho phép user dừng
+            msg = evt.get("message") or {}
             text = (msg.get("text") or "").strip()
             if psid and text:
-                upsert_psid_to_csv(psid)
-                app.logger.info(f"MSG from {psid}: {text!r}")
-                if text.upper() == "DỪNG":
+                if text.upper() in {"DUNG", "DỪNG", "STOP"}:
+                    # (tuỳ chọn) bạn có thể xoá PSID khỏi CSV nếu muốn
                     try:
-                        send_text(psid, "Bạn đã hủy nhận nhắc. Nhắn 'BẮT ĐẦU' để bật lại.")
-                    except Exception as e:
-                        app.logger.exception(f"Reply failed: {e}")
+                        send_text(psid, "Đã ghi nhận dừng nhắc. Cảm ơn bạn!")
+                    except Exception:
+                        pass
 
-            # Attachments: nếu là ảnh → OCR & GỬI XÁC NHẬN (Người gửi / Số tiền / Ngày giờ)
+            # (Tuỳ chọn) biết người vào từ ref nào
+            ref = extract_ref(evt)
+            if psid and ref:
+                app.logger.info(f"REF '{ref}' from {psid}")
+
+            # Attachments: nếu là ảnh → OCR nhanh (Amount/Date)
             attachments = msg.get("attachments") or []
             for att in attachments:
                 if (att.get("type") or "").lower() == "image":
@@ -248,74 +260,50 @@ def webhook_receive():
                     image_url = payload.get("url")
                     if not image_url:
                         continue
-                    app.logger.info(f"OCR image_url: {image_url}")
+                    app.logger.info(f"OCRFAST image_url: {image_url}")
                     try:
-                        # Có thể truyền expected nếu muốn so khớp; tạm để {}
-                        result = verify_image_against_expected(image_url, expected={})
-                        ext  = result.get("extracted")   or {}
-                        conf = result.get("conf_stats")  or {}
-                        raw  = (ext.get("raw_text") or "")[:1000]  # debug cắt 1000 ký tự
+                        out = fast_extract_amount_date(image_url)
+                        amt_txt = out.get("amount_text")
+                        amt_val = out.get("amount")
+                        when    = out.get("date_text")
+                        avgc    = out.get("avg_conf")
 
-                        # Trường chính để XÁC NHẬN
-                        sender  = ext.get("sender_name") or "-"
-                        amt     = ext.get("amount")
-                        when    = ext.get("datetime_text") or "-"
-
-                        # Thông tin thêm
-                        acc_from = ext.get("sender_account") or "-"
-                        acc_to   = ext.get("account_number") or "-"
-                        memo     = (ext.get("memo") or "-").strip()
-                        txid     = ext.get("tx_code") or "-"
-
-                        # Format số tiền
-                        if isinstance(amt, int):
-                            amt_txt = f"{amt:,} VND".replace(",", ".")
+                        # format số tiền
+                        if isinstance(amt_val, int):
+                            amt_show = f"{amt_val:,} VND".replace(",", ".")
                         else:
-                            amt_txt = ext.get("amount_text") or "-"
+                            amt_show = amt_txt or "-"
 
-                        # ==== Tin nhắn xác nhận ====
+                        note = ""
+                        if out.get("timeout"):
+                            note = "\n[Note] Xử lý lâu, đã trả nhanh theo kết quả tạm."
+                        if out.get("note"):
+                            note += f"\n[Note] {out.get('note')}"
+
                         confirm = (
-                            "✅ ĐÃ NHẬN BẰNG CHỨNG CHUYỂN KHOẢN\n"
-                            f"• Người gửi: {sender}\n"
-                            f"• Số tiền: {amt_txt}\n"
-                            f"• Ngày/giờ: {when}\n"
-                            f"• STK gửi → nhận: {acc_from} → {acc_to}\n"
-                            f"• Nội dung: {memo}\n"
-                            f"• Mã GD: {txid}\n"
+                            "✅ KẾT QUẢ NHANH\n"
+                            f"• Số tiền: {amt_show}\n"
+                            f"• Ngày/giờ: {when or '-'}\n"
                         )
+                        if avgc is not None:
+                            confirm += f"• Độ tin cậy trung bình: {avgc:.2f}\n"
+                        confirm += note
 
-                        # Debug note nếu thiếu
-                        missing = []
-                        if not ext.get("sender_name"): missing.append("Người gửi")
-                        if not ext.get("amount") and not ext.get("amount_text"): missing.append("Số tiền")
-                        if not ext.get("datetime_text"): missing.append("Ngày/giờ")
-
-                        if missing:
-                            avg = conf.get("avg")
-                            debug_note = "\n[Debug]"
-                            debug_note += "\n- Thiếu: " + ", ".join(missing)
-                            if avg is not None:
-                                debug_note += f"\n- Độ tin cậy trung bình OCR: {avg:.2f}"
-                            debug_note += "\n- Văn bản OCR (cắt ngắn):\n" + raw
-                            confirm += "\n" + debug_note
+                        if not amt_txt and not when:
+                            confirm += "\n⚠️ Chưa nhận diện được Số tiền/Ngày. Vui lòng gửi ảnh rõ hơn."
 
                         send_text(psid, confirm)
 
                     except Exception as e:
-                        app.logger.exception(f"OCR failed: {e}")
+                        app.logger.exception(f"OCRFAST failed: {e}")
                         try:
-                            send_text(psid, "⚠️ Xin lỗi, chưa đọc được ảnh. Vui lòng gửi lại ảnh rõ nét hơn.")
-                        except:
+                            send_text(psid, "⚠️ Xin lỗi, chưa đọc được ảnh (chế độ nhanh). Vui lòng gửi ảnh rõ nét hơn.")
+                        except Exception:
                             pass
-
-            # Referral (tham khảo)
-            ref = extract_ref(evt)
-            if psid and ref:
-                app.logger.info(f"REF '{ref}' from {psid}")
 
     return "ok", 200
 
-# 3) Cron endpoint – gửi theo CSV/ENV; hỗ trợ psids= & msg=
+# 3) Cron endpoint – gửi cho 1 nhóm duy nhất (CSV public hoặc TEST_PSIDS); hỗ trợ psids=&msg=
 @app.post("/task/weekly")
 def task_weekly():
     if request.headers.get("X-CRON-SECRET") != CRON_SECRET:
@@ -323,17 +311,18 @@ def task_weekly():
     if not PAGE_TOKEN:
         return jsonify({"error": "PAGE_TOKEN is missing"}), 500
 
-    psids_param = request.args.get("psids")   # ví dụ: "111,222"
-    custom      = request.args.get("msg")     # nội dung tùy chọn
+    # Ưu tiên psids= (ad-hoc), sau đó CSV public; cuối cùng fallback TEST_PSIDS
+    psids_param = request.args.get("psids")  # "111,222"
+    custom = request.args.get("msg")         # nội dung tùy chọn
 
     if psids_param:
         targets = [p.strip() for p in psids_param.split(",") if p.strip()]
         mode = "psids"
     else:
-        csv_psids = load_psids_from_csv()
+        csv_psids = load_psids_from_csv_public()
         if csv_psids:
             targets = csv_psids
-            mode = "CSV"
+            mode = "CSV_PUBLIC"
         else:
             targets = TEST_PSIDS
             mode = "TEST_PSIDS"
@@ -346,14 +335,14 @@ def task_weekly():
         try:
             send_text(p, msg)
             sent += 1
-            time.sleep(0.2)  # giãn nhẹ tránh rate limit
+            time.sleep(0.2)  # giãn nhẹ
         except Exception as e:
             app.logger.exception(f"Send failed for {p}: {e}")
 
     # Timestamp UTC + VN
     now_utc = dt.datetime.now(dt.timezone.utc)
-    vn_tz   = ZoneInfo("Asia/Ho_Chi_Minh")
-    now_vn  = now_utc.astimezone(vn_tz)
+    vn_tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    now_vn = now_utc.astimezone(vn_tz)
 
     return jsonify({
         "mode": mode,
@@ -363,6 +352,22 @@ def task_weekly():
         "server_time_vietnam": now_vn.isoformat(timespec="seconds")
     })
 
-# ================== MAIN ==================
+# 4) Endpoint debug OCR nhanh
+@app.get("/debug/ocr")
+def debug_ocr():
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    try:
+        out = fast_extract_amount_date(url)
+        # rút gọn danh sách dòng để JSON gọn
+        if "lines" in out and isinstance(out["lines"], list):
+            out["lines"] = out["lines"][:60]
+        return jsonify(out)
+    except Exception as e:
+        app.logger.exception(f"/debug/ocr failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ================ MAIN ================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
