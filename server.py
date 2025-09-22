@@ -318,36 +318,36 @@ def webhook_receive():
                     app.logger.info(f"OCRFAST image_url: {image_url}")
                     try:
                         out = fast_extract_amount_date(image_url)
-                        amt_txt = out.get("amount_text")
-                        amt_val = out.get("amount")
-                        when    = out.get("date_text")
-                        avgc    = out.get("avg_conf")
+                        amt_v = out.get("amount")
+                        amt_t = out.get("amount_text")
+                        when  = out.get("date_text")
 
-                        # format số tiền
-                        if isinstance(amt_val, int):
-                            amt_show = f"{amt_val:,} VND".replace(",", ".")
+                        snd_n = out.get("sender_name")
+                        snd_p = out.get("sender_phone")
+                        rcv_n = out.get("recipient_name")
+                        rcv_p = out.get("recipient_phone")
+
+                        txid  = out.get("txn_id")
+                        avgc  = out.get("avg_conf")
+
+                        if isinstance(amt_v, int):
+                            amt_show = f"{amt_v:,} VND".replace(",", ".")
                         else:
-                            amt_show = amt_txt or "-"
+                            amt_show = amt_t or "-"
 
-                        note = ""
-                        if out.get("timeout"):
-                            note = "\n[Note] Xử lý lâu, đã trả kết quả nhanh."
-                        if out.get("note"):
-                            note += f"\n[Note] {out.get('note')}"
-
-                        confirm = (
-                            "✅ KẾT QUẢ NHANH\n"
+                        msg = (
+                            "✅ KẾT QUẢ (MoMo)\n"
+                            f"• Người gửi: {snd_n or '-'}\n"
+                            f"• SĐT gửi: {snd_p or '-'}\n"
+                            f"• Người nhận: {rcv_n or '-'}\n"
+                            f"• SĐT nhận: {rcv_p or '-'}\n"
                             f"• Số tiền: {amt_show}\n"
                             f"• Ngày/giờ: {when or '-'}\n"
                         )
-                        if avgc is not None:
-                            confirm += f"• Độ tin cậy trung bình: {avgc:.2f}\n"
-                        confirm += note
+                        if txid: msg += f"• Mã GD: {txid}\n"
+                        if avgc is not None: msg += f"• Độ tin cậy TB: {avgc:.2f}\n"
 
-                        if not amt_txt and not when:
-                            confirm += "\n⚠️ Chưa nhận diện được Số tiền/Ngày. Vui lòng gửi ảnh rõ hơn."
-
-                        send_text(psid, confirm)
+                        send_text(psid, msg)
 
                     except Exception as e:
                         app.logger.exception(f"OCRFAST failed: {e}")
