@@ -14,17 +14,22 @@ from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
-# === OCR nhanh (Amount/Date ≤30s) ===
+# --- DE-DUPE chống xử lý trùng sự kiện ---
+import sqlite3
+import threading
+
+# === OCR nhanh (Amount/Date ≤~30s) ===
 from ocr_fast import fast_extract_amount_date
 
 # ================== ENV ==================
-load_dotenv()  # local dùng .env; Render dùng Env Vars
+load_dotenv()  # local: .env ; Render: Env Vars
 
 PAGE_TOKEN      = os.getenv("PAGE_TOKEN")                  # EAA...
 VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "changeme")
 CRON_SECRET     = os.getenv("CRON_SECRET", "secret")
 TEST_PSIDS      = [p.strip() for p in os.getenv("TEST_PSIDS", "").split(",") if p.strip()]
 PSIDS_CSV_URL   = os.getenv("PSIDS_CSV_URL", "")           # raw URL tới psids.csv (đọc)
+
 # Ghi CSV qua GitHub API:
 GH_OWNER        = os.getenv("GH_OWNER", "")
 GH_REPO         = os.getenv("GH_REPO", "")
@@ -32,10 +37,52 @@ GH_BRANCH       = os.getenv("GH_BRANCH", "main")
 GH_FILE_PATH    = os.getenv("GH_FILE_PATH", "psids.csv")
 GH_TOKEN        = os.getenv("GH_TOKEN", "")                # token có quyền Contents: Read & write
 
+# DB dedupe (file SQLite nằm trong /tmp để phù hợp Render)
+DB_PATH         = os.getenv("DEDUP_DB_PATH", "/tmp/messenger_dedupe.sqlite3")
+_db_lock = threading.Lock()
+
 # ================ APP & LOG ================
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
+
+# ================== DEDUPE HELPERS ==================
+def _db_init():
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS seen_mids(
+                    mid TEXT PRIMARY KEY,
+                    seen_at INTEGER
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_at ON seen_mids(seen_at)")
+            conn.commit()
+        finally:
+            conn.close()
+
+def seen_before(mid: str) -> bool:
+    """Trả True nếu mid đã xử lý rồi (trong 24h), ngược lại đánh dấu là đã thấy và trả False."""
+    if not mid:
+        return False
+    now = int(time.time())
+    ttl = now - 24 * 3600  # lưu 24h
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            # dọn rác bản ghi cũ
+            conn.execute("DELETE FROM seen_mids WHERE seen_at < ?", (ttl,))
+            cur = conn.execute("SELECT 1 FROM seen_mids WHERE mid = ?", (mid,))
+            if cur.fetchone():
+                return True
+            conn.execute("INSERT INTO seen_mids(mid, seen_at) VALUES (?,?)", (mid, now))
+            conn.commit()
+            return False
+        finally:
+            conn.close()
+
+_db_init()
 
 # ================ HELPERS: Facebook ================
 def send_text(psid: str, text: str):
@@ -112,7 +159,6 @@ def gh_read_csv_targets(owner: str, repo: str, path: str, ref: str) -> Dict[str,
     if info.get("encoding") == "base64" and "content" in info:
         raw = base64.b64decode(info["content"]).decode("utf-8", errors="ignore")
     else:
-        # fallback: tải qua download_url
         dl = info.get("download_url")
         if not dl:
             return {}
@@ -131,7 +177,6 @@ def gh_read_csv_targets(owner: str, repo: str, path: str, ref: str) -> Dict[str,
                 out[psid] = {"psid": psid, "created_at_iso": created}
     except Exception as e:
         app.logger.exception(f"Parse CSV error: {e}")
-    # append info.sha để update
     if "sha" in info:
         out["_sha"] = info["sha"]
     return out
@@ -142,7 +187,6 @@ def gh_upsert_psid(psid: str) -> bool:
         app.logger.info("GH_* env missing; skip writing PSID to GitHub.")
         return False
 
-    # đọc hiện trạng
     exists = gh_read_csv_targets(GH_OWNER, GH_REPO, GH_FILE_PATH, GH_BRANCH)
     sha = exists.get("_sha")
     targets = {k: v for k, v in exists.items() if not k.startswith("_")}
@@ -151,11 +195,9 @@ def gh_upsert_psid(psid: str) -> bool:
         app.logger.info(f"PSID {psid} already in CSV")
         return True
 
-    # build CSV mới
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     targets[psid] = {"psid": psid, "created_at_iso": now_iso}
 
-    # luôn có header
     rows = sorted(targets.values(), key=lambda x: x["created_at_iso"])
     out_io = StringIO()
     writer = csv.DictWriter(out_io, fieldnames=["psid", "created_at_iso"])
@@ -164,13 +206,12 @@ def gh_upsert_psid(psid: str) -> bool:
         writer.writerow(r)
     new_b64 = base64.b64encode(out_io.getvalue().encode("utf-8")).decode("ascii")
 
-    # ghi lại
     msg = f"chore(csv): upsert psid {psid}"
     gh_put_file(GH_OWNER, GH_REPO, GH_FILE_PATH, new_b64, msg, sha, GH_BRANCH)
     app.logger.info(f"Appended PSID {psid} to {GH_FILE_PATH}")
     return True
 
-# ================ MISC ================
+# ================ MISC ==================
 def extract_ref(evt: dict) -> Optional[str]:
     if (evt.get("referral") or {}).get("ref"):
         return evt["referral"]["ref"]
@@ -218,15 +259,31 @@ def webhook_receive():
             if psid:
                 app.logger.info(f"PSID: {psid}")
 
-            # Lưu PSID ngay khi có bất kỳ tương tác
+            # Lưu PSID ngay khi có tương tác (không ảnh hưởng dedupe)
             try:
-                gh_upsert_psid(psid)
+                if psid:
+                    gh_upsert_psid(psid)
             except Exception as e:
                 app.logger.exception(f"upsert psid failed: {e}")
 
-            # GET_STARTED postback
             postback = (evt.get("postback") or {})
             payload = (postback.get("payload") or "")
+
+            # === MESSAGE BLOCK ===
+            msg = evt.get("message") or {}
+
+            # 1) BỎ QUA ECHO (bot tự nhận tin do mình gửi)
+            if msg.get("is_echo"):
+                app.logger.info("Skip echo message")
+                continue
+
+            # 2) DE-DUPE THEO MID (bỏ qua nếu xử lý rồi)
+            mid = msg.get("mid")
+            if mid and seen_before(mid):
+                app.logger.info(f"Skip duplicated mid={mid}")
+                continue
+
+            # 3) Xử lý GET_STARTED
             if psid and payload == "GET_STARTED":
                 try:
                     send_text(psid,
@@ -236,12 +293,10 @@ def webhook_receive():
                 except Exception as e:
                     app.logger.exception(f"Reply failed: {e}")
 
-            # Message text: cho phép user dừng
-            msg = evt.get("message") or {}
+            # 4) Người dùng yêu cầu dừng
             text = (msg.get("text") or "").strip()
             if psid and text:
                 if text.upper() in {"DUNG", "DỪNG", "STOP"}:
-                    # (tuỳ chọn) bạn có thể xoá PSID khỏi CSV nếu muốn
                     try:
                         send_text(psid, "Đã ghi nhận dừng nhắc. Cảm ơn bạn!")
                     except Exception:
@@ -252,12 +307,12 @@ def webhook_receive():
             if psid and ref:
                 app.logger.info(f"REF '{ref}' from {psid}")
 
-            # Attachments: nếu là ảnh → OCR nhanh (Amount/Date)
+            # 5) Ảnh đính kèm → OCR nhanh
             attachments = msg.get("attachments") or []
             for att in attachments:
                 if (att.get("type") or "").lower() == "image":
-                    payload = att.get("payload") or {}
-                    image_url = payload.get("url")
+                    payload_att = att.get("payload") or {}
+                    image_url = payload_att.get("url")
                     if not image_url:
                         continue
                     app.logger.info(f"OCRFAST image_url: {image_url}")
@@ -276,7 +331,7 @@ def webhook_receive():
 
                         note = ""
                         if out.get("timeout"):
-                            note = "\n[Note] Xử lý lâu, đã trả nhanh theo kết quả tạm."
+                            note = "\n[Note] Xử lý lâu, đã trả kết quả nhanh."
                         if out.get("note"):
                             note += f"\n[Note] {out.get('note')}"
 
@@ -360,7 +415,6 @@ def debug_ocr():
         return jsonify({"error": "missing url"}), 400
     try:
         out = fast_extract_amount_date(url)
-        # rút gọn danh sách dòng để JSON gọn
         if "lines" in out and isinstance(out["lines"], list):
             out["lines"] = out["lines"][:60]
         return jsonify(out)
@@ -370,4 +424,6 @@ def debug_ocr():
 
 # ================ MAIN ================
 if __name__ == "__main__":
+    # Khi test muốn chắc chắn không lặp, có thể chạy 1 worker:
+    # app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
