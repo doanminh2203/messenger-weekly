@@ -318,37 +318,19 @@ def webhook_receive():
                     app.logger.info(f"OCRFAST image_url: {image_url}")
                     try:
                         out = fast_extract_amount_date(image_url)
-                        amt_v = out.get("amount")
-                        amt_t = out.get("amount_text")
-                        when  = out.get("date_text")
-
-                        snd_n = out.get("sender_name")
-                        snd_p = out.get("sender_phone")
-                        rcv_n = out.get("recipient_name")
-                        rcv_p = out.get("recipient_phone")
-
-                        txid  = out.get("txn_id")
-                        avgc  = out.get("avg_conf")
-
-                        if isinstance(amt_v, int):
-                            amt_show = f"{amt_v:,} VND".replace(",", ".")
-                        else:
-                            amt_show = amt_t or "-"
+                        amt_show = out.get("amount_text") or "-"
+                        when     = out.get("date_text") or "-"
+                        actor    = out.get("actor_name") or "-"
+                        detail   = out.get("detail_text") or "-"
 
                         msg = (
                             "✅ KẾT QUẢ (MoMo)\n"
-                            f"• Người gửi: {snd_n or '-'}\n"
-                            f"• SĐT gửi: {snd_p or '-'}\n"
-                            f"• Người nhận: {rcv_n or '-'}\n"
-                            f"• SĐT nhận: {rcv_p or '-'}\n"
                             f"• Số tiền: {amt_show}\n"
-                            f"• Ngày/giờ: {when or '-'}\n"
+                            f"• Thời gian: {when}\n"
+                            f"• Người thực hiện: {actor}\n"
+                            f"• Chi tiết: {detail}\n"
                         )
-                        if txid: msg += f"• Mã GD: {txid}\n"
-                        if avgc is not None: msg += f"• Độ tin cậy TB: {avgc:.2f}\n"
-
                         send_text(psid, msg)
-
                     except Exception as e:
                         app.logger.exception(f"OCRFAST failed: {e}")
                         try:
