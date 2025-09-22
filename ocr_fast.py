@@ -87,7 +87,7 @@ DATE_PATS = [
 VN_PHONE = re.compile(r"(\+?84|0)\s?\d{2}\s?\d{3}\s?\d{4,5}")
 
 # Người nhận (đã có)
-RECIPIENT_KEYS = ["Đến","Tới","Chuyển tới","Chuyển đến","Người nhận","Recipient","To"]
+RECIPIENT_KEYS = ["Đến","Tới","Chuyển tới","Chuyển đến","Người nhận","Recipient","To", "Chi tiết"]
 # Người gửi (thêm mới)
 SENDER_KEYS = ["Từ","Người gửi","Người chuyển","Sender","From"]
 
