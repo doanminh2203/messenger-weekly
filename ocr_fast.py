@@ -1,9 +1,9 @@
 # ocr_fast.py
-# Trích xuất nhanh biên lai MoMo: amount / time / actor("Người thực hiện") / detail("Chi tiết")
-# Bắt giá trị khi nhãn và thông tin có nhiều khoảng trắng, có/không có dấu ":".
+# MoMo OCR nhanh: Số tiền / Thời gian / Người thực hiện / Chi tiết
+# BẮT NHÃN KHÔNG PHÂN BIỆT DẤU + LINH HOẠT KHOẢNG TRẮNG
 
-import logging, time, re
-from typing import Dict, List, Optional, Tuple
+import logging, time, re, unicodedata
+from typing import Dict, List, Optional
 
 import requests
 import numpy as np, cv2
@@ -16,7 +16,6 @@ logger = logging.getLogger("server")
 HTTP_TIMEOUT = 12
 MAX_BYTES    = 12 * 1024 * 1024
 MAX_SIDE     = 1280
-OCR_HARD_BUDGET = 20
 
 _OCR = None
 def _ocr():
@@ -29,12 +28,12 @@ def _fetch_image_bytes(url: str) -> bytes:
     r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=HTTP_TIMEOUT, stream=True)
     r.raise_for_status()
     buf = BytesIO(); read = 0
-    for piece in r.iter_content(64*1024):
-        if not piece: break
-        read += len(piece)
+    for chunk in r.iter_content(64*1024):
+        if not chunk: break
+        read += len(chunk)
         if read > MAX_BYTES:
             raise ValueError("Image too large")
-        buf.write(piece)
+        buf.write(chunk)
     data = buf.getvalue()
     if not data:
         raise ValueError("Empty image")
@@ -71,74 +70,75 @@ def _run_ocr(img: np.ndarray) -> List[str]:
     elif isinstance(out, tuple) and len(out) == 3:
         _, texts, _ = out
         lines = [str(t).strip() for t in (texts or []) if str(t).strip()]
-    # chuẩn hoá khoảng trắng
+    # rút gọn khoảng trắng
     return [re.sub(r"\s+", " ", ln).strip() for ln in lines]
 
-# ===== Regex theo format MoMo =====
+# ---------- Chuẩn hoá không dấu ----------
+def _strip_accents(s: str) -> str:
+    # loại bỏ dấu tiếng Việt (NFD + bỏ combining marks)
+    s_norm = unicodedata.normalize('NFD', s)
+    s_no = "".join(ch for ch in s_norm if unicodedata.category(ch) != 'Mn')
+    return unicodedata.normalize('NFC', s_no)
+
+def _norm_key(s: str) -> str:
+    # không dấu + thường + rút gọn khoảng trắng
+    s2 = _strip_accents(s).lower()
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
+
+# ---------- Regex/nhãn ----------
 RE_AMOUNT = re.compile(
-    r"(?:^[\+\-]?\s*\d{1,3}(?:[\. ]\d{3})+\s*[đd]|Số\s*tiền\s*[:\-]?\s*\d{1,3}(?:[\. ]\d{3})+\s*(?:VND|VNĐ|đ|d)?)",
+    r"(?:^[\+\-]?\s*\d{1,3}(?:[\. ]\d{3})+\s*[đd]|so\s*tien\s*[:\-]?\s*\d{1,3}(?:[\. ]\d{3})+\s*(?:vnd|vnđ|đ|d)?)",
     re.IGNORECASE
 )
-RE_TIME = re.compile(
+RE_TIME_FALLBACK = re.compile(
     r"(\d{1,2}[:h]\d{2}(?::\d{2})?\s*-\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s+\d{1,2}[:h]\d{2}(?::\d{2})?)"
 )
 
-# Tạo regex nhãn với \s+ giữa các từ (để chịu được OCR bẻ khoảng trắng)
-def _label_pattern(words: str) -> str:
-    # ví dụ "Người thực hiện" -> "Người\s+thực\s+hiện"
-    return r"\s+".join(map(re.escape, words.split()))
-
-LABELS_TIME   = [ "Thời gian", "Time", "Date" ]
-LABELS_ACTOR  = [ "Người thực hiện", "Người gửi", "Sender", "From", "Nguoi thuc hien" ]
-LABELS_DETAIL = [ "Chi tiết", "Nội dung", "Content", "Detail" ]
-
-TIME_RE   = re.compile(rf"^({'|'.join(_label_pattern(x) for x in LABELS_TIME)})\b", re.IGNORECASE)
-ACTOR_RE  = re.compile(rf"^({'|'.join(_label_pattern(x) for x in LABELS_ACTOR)})\b", re.IGNORECASE)
-DETAIL_RE = re.compile(rf"^({'|'.join(_label_pattern(x) for x in LABELS_DETAIL)})\b", re.IGNORECASE)
+LABELS_TIME    = ["thoi gian", "time", "date"]
+LABELS_ACTOR   = ["nguoi thuc hien", "nguoi gui", "sender", "from"]
+LABELS_DETAIL  = ["chi tiet", "noi dung", "content", "detail"]
 
 def _normalize_amount(token: str) -> Optional[str]:
     if not token: return None
-    x = token.upper().replace("VND", "đ").replace("VNĐ", "đ").replace(" ", "")
+    x = token.upper().replace("VND","đ").replace("VNĐ","đ")
+    x = x.replace(" ", "")
     m = re.search(r"[\+\-]?\d{1,3}(?:[\.]\d{3})+\s*[đD]", x)
     if m:
-        show = m.group(0).replace("D", "đ")
-        return show
+        return m.group(0).replace("D","đ")
     m2 = re.search(r"\d{1,3}(?:[\.]\d{3})+", x)
     if m2:
         return m2.group(0) + "đ"
     return None
 
-def _looks_like_label(s: str) -> bool:
-    return bool(TIME_RE.match(s) or ACTOR_RE.match(s) or DETAIL_RE.match(s))
+def _looks_like_label_norm(norm: str) -> bool:
+    return any(norm.startswith(k) for k in LABELS_TIME + LABELS_ACTOR + LABELS_DETAIL)
 
-def _value_after_label(lines: List[str], idx: int) -> Optional[str]:
+def _value_after_label(orig_lines: List[str], idx: int) -> Optional[str]:
     """
-    Lấy giá trị cho 1 nhãn: thử cùng dòng (sau ':' hoặc chỉ cách bằng space),
-    nếu không có thì lấy 1–3 dòng kế tiếp (bỏ qua dòng rỗng hoặc lại là nhãn).
+    Lấy value từ bản gốc:
+      - cùng dòng sau ':', '-', hoặc khoảng trắng kép
+      - nếu không có → lấy 1–3 dòng kế tiếp (bỏ qua dòng là nhãn)
     """
-    cur = lines[idx]
+    cur = orig_lines[idx]
 
-    # 1) cùng dòng — có hoặc không có dấu ':' / '-'
     m = re.search(r"(?:[:\-–—]\s*|\s{2,})(.+)$", cur)
     if m:
         val = m.group(1).strip(" :|-–—")
-        if val:
-            return val
+        if val: return val
 
-    # 2) ghép cửa sổ 2 dòng (label + next) để bắt dạng label   value (hai cột)
-    if idx + 1 < len(lines):
-        join2 = (cur + " " + lines[idx+1]).strip()
+    # Ghép 2 dòng (để bắt layout 2 cột)
+    if idx + 1 < len(orig_lines):
+        join2 = (cur + " " + orig_lines[idx+1]).strip()
         m2 = re.search(r"(?:[:\-–—]\s*|\s{2,})(.+)$", join2)
         if m2:
             val = m2.group(1).strip(" :|-–—")
-            if val:
-                return val
+            if val: return val
 
-    # 3) dò 1–3 dòng kế tiếp
     for j in range(1, 4):
-        if idx + j < len(lines):
-            cand = lines[idx + j].strip(" :|-–—").strip()
-            if cand and not _looks_like_label(cand):
+        if idx + j < len(orig_lines):
+            cand = orig_lines[idx+j].strip(" :|-–—").strip()
+            if cand and not _looks_like_label_norm(_norm_key(cand)):
                 return cand
     return None
 
@@ -147,18 +147,27 @@ def fast_extract_amount_date(image_url: str) -> Dict:
     data = _fetch_image_bytes(image_url)
     img  = _resize_fast(_decode_to_bgr(data))
     lines = _run_ocr(img)
-    full  = "\n".join(lines)
 
-    # ----- SỐ TIỀN -----
+    # Bản không dấu để dò nhãn
+    norms = [_norm_key(ln) for ln in lines]
+
+    # ---------- AMOUNT ----------
     amount_text = None
     for ln in lines:
-        m = RE_AMOUNT.search(ln)
+        m = RE_AMOUNT.search(_norm_key(ln))
         if m:
-            amount_text = _normalize_amount(m.group(0))
-        if amount_text:
-            break
+            # m.group(0) là trên bản đã normalize; để hiển thị đẹp, lấy lại từ ln
+            # thử tìm số trong ln gốc
+            cand = _normalize_amount(ln)
+            if not cand:
+                cand = _normalize_amount(m.group(0))
+            if cand:
+                amount_text = cand
+                break
     if not amount_text:
-        m2 = re.search(r"[\+\-]?\s*\d{1,3}(?:[\. ]\d{3})+\s*[đdD]\b", full)
+        # fallback: quét trong toàn bộ text không dấu
+        full_norm = "\n".join(norms)
+        m2 = re.search(r"[\+\-]?\s*\d{1,3}(?:[\. ]\d{3})+\s*[đd]\b", full_norm)
         if m2:
             amount_text = _normalize_amount(m2.group(0))
 
@@ -169,27 +178,29 @@ def fast_extract_amount_date(image_url: str) -> Dict:
             try: amount_val = int(num)
             except: pass
 
-    # ----- THỜI GIAN -----
+    # ---------- TIME ----------
     date_text = None
-    for i, ln in enumerate(lines):
-        if TIME_RE.match(ln):
+    for i, n in enumerate(norms):
+        if any(n.startswith(k) for k in LABELS_TIME):
             date_text = _value_after_label(lines, i)
             if date_text: break
     if not date_text:
-        m = RE_TIME.search(full)
+        # fallback regex trên bản gốc
+        full = "\n".join(lines)
+        m = RE_TIME_FALLBACK.search(full)
         if m: date_text = m.group(1)
 
-    # ----- NGƯỜI THỰC HIỆN -----
+    # ---------- ACTOR ----------
     actor_name = None
-    for i, ln in enumerate(lines):
-        if ACTOR_RE.match(ln):
+    for i, n in enumerate(norms):
+        if any(n.startswith(k) for k in LABELS_ACTOR):
             actor_name = _value_after_label(lines, i)
             if actor_name: break
 
-    # ----- CHI TIẾT -----
+    # ---------- DETAIL ----------
     detail_text = None
-    for i, ln in enumerate(lines):
-        if DETAIL_RE.match(ln):
+    for i, n in enumerate(norms):
+        if any(n.startswith(k) for k in LABELS_DETAIL):
             detail_text = _value_after_label(lines, i)
             if detail_text: break
 
@@ -201,5 +212,5 @@ def fast_extract_amount_date(image_url: str) -> Dict:
         "actor_name": actor_name,
         "detail_text": detail_text,
         "spent_sec": spent,
-        "lines": lines[:80],  # debug nếu cần
+        "lines": lines[:100],
     }
