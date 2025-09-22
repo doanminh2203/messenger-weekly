@@ -89,7 +89,7 @@ def _label_pattern(words: str) -> str:
     return r"\s+".join(map(re.escape, words.split()))
 
 LABELS_TIME   = [ "Thời gian", "Time", "Date" ]
-LABELS_ACTOR  = [ "Người thực hiện", "Người gửi", "Sender", "From" ]
+LABELS_ACTOR  = [ "Người thực hiện", "Người gửi", "Sender", "From", "Nguoi thuc hien" ]
 LABELS_DETAIL = [ "Chi tiết", "Nội dung", "Content", "Detail" ]
 
 TIME_RE   = re.compile(rf"^({'|'.join(_label_pattern(x) for x in LABELS_TIME)})\b", re.IGNORECASE)
