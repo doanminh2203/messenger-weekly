@@ -9,16 +9,17 @@ import logging
 import datetime as dt
 from io import StringIO
 from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 import requests
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
-# ---- OCR nhanh (yêu cầu ocr_fast.py trong repo) ----
+# ---- OCR nhanh (tùy chọn) ----
 try:
     # phải trả về dict: {amount_text, date_text, actor_name, detail_text, lines, spent_sec}
-    from ocr_fast import fast_extract_amount_date
+    from ocr_fast import fast_extract_amount_date  # optional
 except Exception as e:
     fast_extract_amount_date = None
     _OCR_IMPORT_ERR = e
@@ -39,7 +40,13 @@ GH_FILE_PATH    = os.getenv("GH_FILE_PATH", "psids.csv")
 GH_TOKEN        = os.getenv("GH_TOKEN", "")
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-CSV_HEADERS = ["psid", "user_facebook", "user_momo", "mute_until", "created_at_iso"]
+
+# THÊM cột 'status' (1=đã đóng, 0=chưa)
+CSV_HEADERS = [
+    "psid", "user_facebook", "user_momo",
+    "mute_until", "created_at_iso", "last_user_msg_iso",
+    "status"
+]
 
 # ================= APP & LOG =================
 app = Flask(__name__)
@@ -100,36 +107,24 @@ def extract_strict_slash_date_from_text(text: str) -> Optional[Tuple[str, Tuple[
         return None
     return (m.group(0), (month, year))
 
-def extract_momo_date(lines: List[str], fallback_text: str) -> Tuple[str, Optional[Tuple[int,int]]]:
-    # ưu tiên dòng chứa "Thời gian/Thoi gian"
-    for ln in lines or []:
-        if re.search(r"\b(thoi\s*gia[mn]|thời\s*gia[mn])\b", ln, flags=re.I):
-            hit = extract_strict_slash_date_from_text(ln)
-            if hit:
-                return hit[0], hit[1]
-    # quét tất cả dòng
-    for ln in lines or []:
-        hit = extract_strict_slash_date_from_text(ln)
-        if hit:
-            return hit[0], hit[1]
-    # fallback: text tổng hợp
-    hit = extract_strict_slash_date_from_text(fallback_text or "")
-    if hit:
-        return hit[0], hit[1]
-    return "-", None
-
-def _now_vn_date() -> dt.date:
-    return dt.datetime.now(VN_TZ).date()
+def is_current_month_vn(month: int, year: int) -> bool:
+    today = datetime.now(VN_TZ).date()
+    return (month == today.month) and (year == today.year)
 
 def _first_day_next_month_vn() -> dt.date:
-    today = _now_vn_date()
+    today = datetime.now(VN_TZ).date()
     year = today.year + (1 if today.month == 12 else 0)
     month = 1 if today.month == 12 else today.month + 1
     return dt.date(year, month, 1)
 
-def is_current_month_vn(month: int, year: int) -> bool:
-    today = _now_vn_date()
-    return (month == today.month) and (year == today.year)
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def parse_amount_to_int(amount_text: Optional[str]) -> Optional[int]:
+    if not amount_text:
+        return None
+    digits = re.sub(r"[^\d]", "", amount_text)
+    return int(digits) if digits.isdigit() else None
 
 # ================= CSV helpers (GitHub) =================
 def load_psids_csv() -> List[Dict[str, str]]:
@@ -145,7 +140,10 @@ def load_psids_csv() -> List[Dict[str, str]]:
         f = StringIO(text)
         reader = csv.DictReader(f)
         for r in reader:
+            # fill missing keys with defaults
             row = {h: (r.get(h, "") or "").strip() for h in CSV_HEADERS}
+            if "status" not in r:
+                row["status"] = "0"
             rows.append(row)
     except Exception as e:
         app.logger.exception(f"Failed to load CSV (read): {e}")
@@ -180,6 +178,8 @@ def save_psids_csv(rows: List[Dict[str, str]], commit_msg: str) -> bool:
             "user_momo": r.get("user_momo", "").strip(),
             "mute_until": r.get("mute_until", "").strip(),
             "created_at_iso": r.get("created_at_iso", "").strip(),
+            "last_user_msg_iso": r.get("last_user_msg_iso", "").strip(),
+            "status": (r.get("status", "").strip() or "0"),
         })
     content_b64 = base64.b64encode(out.getvalue().encode("utf-8")).decode("ascii")
 
@@ -202,6 +202,8 @@ def upsert_row_by_psid(rows: List[Dict[str, str]], psid: str, fb_name: str) -> L
             found = True
             if not (r.get("user_facebook") or "").strip() and fb_name:
                 r["user_facebook"] = fb_name
+            if not (r.get("status") or "").strip():
+                r["status"] = "0"
             break
     if not found:
         rows.append({
@@ -209,83 +211,11 @@ def upsert_row_by_psid(rows: List[Dict[str, str]], psid: str, fb_name: str) -> L
             "user_facebook": fb_name or "",
             "user_momo": "",
             "mute_until": "",
-            "created_at_iso": dt.datetime.now(VN_TZ).isoformat(timespec="seconds"),
+            "created_at_iso": datetime.now(VN_TZ).isoformat(timespec="seconds"),
+            "last_user_msg_iso": "",
+            "status": "0",
         })
     return rows
-
-# ================= Name/Amount matching (thuần loop + if/else) =================
-import unicodedata
-
-def _strip_accents(s: str) -> str:
-    s_norm = unicodedata.normalize("NFD", s or "")
-    s_no = "".join(ch for ch in s_norm if unicodedata.category(ch) != "Mn")
-    return unicodedata.normalize("NFC", s_no)
-
-def norm_name_spaces(s: str) -> str:
-    """Bỏ dấu, lower, rút gọn khoảng trắng, chỉ giữ chữ/số/khoảng trắng."""
-    s2 = _strip_accents(s).lower().strip()
-    s2 = re.sub(r"\s+", " ", s2)
-    s2 = re.sub(r"[^a-z0-9 ]+", "", s2)
-    return s2
-
-def norm_name_nospace(s: str) -> str:
-    return norm_name_spaces(s).replace(" ", "")
-
-def subseq_match_ratio(shorter: str, longer: str) -> float:
-    """Tỷ lệ ký tự của 'shorter' xuất hiện theo thứ tự trong 'longer' (subsequence)."""
-    if not shorter:
-        return 0.0
-    i = j = 0
-    m, n = len(shorter), len(longer)
-    matched = 0
-    while i < m and j < n:
-        if shorter[i] == longer[j]:
-            matched += 1
-            i += 1
-            j += 1
-        else:
-            j += 1
-    return matched / m
-
-def token_coverage_ratio(a_spaces: str, b_spaces: str) -> float:
-    """Tỷ lệ số từ trong a_spaces xuất hiện như substring trong b_spaces."""
-    a_tokens = [t for t in a_spaces.split(" ") if t]
-    if not a_tokens:
-        return 0.0
-    hits = 0
-    for tok in a_tokens:
-        if tok and tok in b_spaces:
-            hits += 1
-    return hits / len(a_tokens)
-
-def names_match(csv_name: str, actor: str, threshold: float = 0.66) -> bool:
-    """
-    So khớp nới lỏng:
-    - subsequence ký tự (không khoảng trắng) >= threshold
-    - HOẶC tỷ lệ từ xuất hiện >= threshold
-    """
-    a_sp = norm_name_spaces(csv_name)
-    b_sp = norm_name_spaces(actor)
-    a_ns = a_sp.replace(" ", "")
-    b_ns = b_sp.replace(" ", "")
-
-    if not a_ns or not b_ns:
-        return False
-
-    char_ratio = subseq_match_ratio(a_ns, b_ns)
-    token_ratio = token_coverage_ratio(a_sp, b_sp)
-
-    if char_ratio >= threshold:
-        return True
-    if token_ratio >= threshold:
-        return True
-    return False
-
-def parse_amount_to_int(amount_text: Optional[str]) -> Optional[int]:
-    if not amount_text:
-        return None
-    digits = re.sub(r"[^\d]", "", amount_text)
-    return int(digits) if digits.isdigit() else None
 
 # ================= Strong de-dup (mid + image_url) =================
 _processed_mids: Dict[str, float] = {}
@@ -360,44 +290,39 @@ def webhook_receive():
                 app.logger.info("Skip duplicate by mid=%s", mid)
                 continue
 
-            # GET_STARTED
-            if evt.get("postback", {}).get("payload") == "GET_STARTED":
-                send_text(psid,
-                    "Chào bạn! Gửi ảnh biên lai MoMo để hệ thống kiểm tra và tự dừng nhắc khi đã đóng 120.000đ trong tháng.")
-                rows = load_psids_csv()
-                rows = upsert_row_by_psid(rows, psid, fb_name="")
-                idx = next((i for i, r in enumerate(rows) if r.get("psid") == psid), None)
-                if idx is not None and not (rows[idx].get("user_facebook") or "").strip():
+            # TẠO/UPDATE DÒNG CSV + TOUCH last_user_msg_iso
+            rows = load_psids_csv()
+            rows = upsert_row_by_psid(rows, psid, fb_name="")
+            idx = next((i for i, r in enumerate(rows) if r.get("psid") == psid), None)
+            if idx is not None:
+                rows[idx]["last_user_msg_iso"] = _now_utc_iso()
+                if not (rows[idx].get("user_facebook") or "").strip():
                     prof = get_user_profile(psid)
                     disp = get_display_name(prof)
                     if disp:
                         rows[idx]["user_facebook"] = disp
-                        if not rows[idx].get("created_at_iso"):
-                            rows[idx]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
-                        save_psids_csv(rows, commit_msg=f"set fb name for {psid} -> {disp}")
-                else:
-                    save_psids_csv(rows, commit_msg="upsert psid on get_started")
+                if not (rows[idx].get("created_at_iso") or "").strip():
+                    rows[idx]["created_at_iso"] = datetime.now(VN_TZ).isoformat(timespec="seconds")
+                save_psids_csv(rows, commit_msg=f"touch last_user_msg for {psid}")
+
+            # GET_STARTED
+            if evt.get("postback", {}).get("payload") == "GET_STARTED":
+                send_text(psid,
+                    "Chào bạn! Gửi ảnh biên lai MoMo để hệ thống kiểm tra.\n"
+                    "Trong 24h kể từ khi bạn nhắn, tôi có thể nhắc tự động.")
                 continue
 
             msg = evt.get("message") or {}
-            text_in = (msg.get("text") or "").strip()
+            text_in = (msg.get("text") or "").strip().lower()
 
-            # bảo đảm có dòng CSV cho PSID
-            rows = load_psids_csv()
-            rows = upsert_row_by_psid(rows, psid, fb_name="")
-            idx = next((i for i, r in enumerate(rows) if r.get("psid") == psid), None)
-            if idx is not None and not (rows[idx].get("user_facebook") or "").strip():
-                prof = get_user_profile(psid)
-                disp = get_display_name(prof)
-                if disp:
-                    rows[idx]["user_facebook"] = disp
-                    if not rows[idx].get("created_at_iso"):
-                        rows[idx]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
-                    save_psids_csv(rows, commit_msg=f"set fb name for {psid} -> {disp}")
-                else:
-                    save_psids_csv(rows, commit_msg="upsert psid on message")
+            # keyword mở phiên (không bắt buộc)
+            if text_in in {"bat dau", "bắt đầu", "nhắc tuần", "nhac tuan"}:
+                send_text(psid,
+                    "✅ Đã ghi nhận tương tác. Trong 24h tới, tôi có thể nhắc tự động.\n"
+                    "Gửi ảnh MoMo để tự dừng nhắc khi đủ 120.000đ.")
+                continue
 
-            # Xử lý ảnh: CHỈ 1 ảnh đầu tiên, và chống trùng theo URL
+            # Xử lý ảnh (1 ảnh đầu tiên + chống trùng)
             atts: List[Dict] = msg.get("attachments") or []
             processed_one = False
             for att in atts:
@@ -407,15 +332,13 @@ def webhook_receive():
                 if not image_url:
                     continue
 
-                # nếu lần đầu thấy mid thì đánh dấu mid; nếu không có mid thì chống trùng theo url
                 if mid:
-                    _processed_mids[mid] = time.time()  # đánh dấu
+                    _processed_mids[mid] = time.time()
                 else:
                     if seen_image(image_url):
                         app.logger.info("Skip duplicate by image_url=%s", image_url)
                         continue
 
-                # Đã xử lý 1 ảnh rồi thì dừng
                 if processed_one:
                     break
 
@@ -435,126 +358,55 @@ def webhook_receive():
                     detail   = result.get("detail_text") or "-"
                     spent    = result.get("spent_sec", 0.0)
 
-                    app.logger.info("=== OCR LINES (%d) ===\n%s\n=== END OCR LINES ===",
-                                    len(lines), "\n".join(lines))
-
-                    # nếu CSV user_facebook trống & OCR có actor -> set ngay
-                    try:
-                        if actor and actor != "-":
-                            rows_cur = load_psids_csv()
-                            idx_psid = next((i for i, r in enumerate(rows_cur) if r.get("psid") == psid), None)
-                            if idx_psid is not None and not (rows_cur[idx_psid].get("user_facebook") or "").strip():
-                                rows_cur[idx_psid]["user_facebook"] = actor
-                                if not rows_cur[idx_psid].get("created_at_iso"):
-                                    rows_cur[idx_psid]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
-                                ok = save_psids_csv(rows_cur, commit_msg=f"set user_facebook for {psid} -> {actor}")
-                                app.logger.info("Set user_facebook from OCR for %s -> %s (saved=%s)", psid, actor, ok)
-                    except Exception as e:
-                        app.logger.exception("Set-name-after-OCR failed: %s", e)
-
-                    # ---- ngày MoMo dd/mm/yyyy (slash only) ----
-                    def extract_strict_date_anywhere(lines_local: List[str], fallback: str):
-                        # ưu tiên dòng chứa từ khóa thời gian
-                        for ln in lines_local or []:
-                            if re.search(r"\b(thoi\s*gia[mn]|thời\s*gia[mn])\b", ln, flags=re.I):
-                                hit = extract_strict_slash_date_from_text(ln)
-                                if hit:
-                                    return hit
-                        # sau đó thử toàn bộ
-                        for ln in lines_local or []:
-                            hit = extract_strict_slash_date_from_text(ln)
-                            if hit:
-                                return hit
-                        # fallback
-                        return extract_strict_slash_date_from_text(fallback or "")
-
-                    hit = extract_strict_date_anywhere(lines, when_txt)
-                    if hit:
-                        date_text_strict, month_year = hit[0], hit[1]
-                    else:
-                        date_text_strict, month_year = "-", None
-
-                    when_txt_display = when_txt or date_text_strict or "-"
-
-                    # điều kiện auto-mute
+                    # ---- kiểm tra điều kiện 'đã đóng' ----
+                    # 1) số tiền
                     amount_val = parse_amount_to_int(amt_text)
-                    did_mute = False
-                    mute_until_str = ""
+                    money_ok = (amount_val == 120000)
 
+                    # 2) ngày thuộc tháng hiện tại (tìm dd/mm/yyyy trong when_txt hoặc trong các line)
+                    month_ok = False
+                    date_found = None
+                    hit = extract_strict_slash_date_from_text(when_txt)
+                    if not hit:
+                        # fallback: quét các dòng OCR
+                        text_join = "\n".join(lines)
+                        hit = extract_strict_slash_date_from_text(text_join)
+                    if hit:
+                        date_found, (mm, yy) = hit
+                        month_ok = is_current_month_vn(mm, yy)
+
+                    # nếu đủ hai điều kiện -> status=1 & mute_until=đầu tháng sau
+                    updated = False
                     rows2 = load_psids_csv()
-
-                    # Tìm dòng ứng viên theo PSID
-                    target_idx = next((i for i, r in enumerate(rows2) if r.get("psid") == psid), None)
-
-                    # Lấy tên tham chiếu để so khớp: ưu tiên user_momo, fallback user_facebook
-                    csv_name = ""
-                    if target_idx is not None:
-                        row = rows2[target_idx]
-                        csv_name = (row.get("user_momo") or "").strip() or (row.get("user_facebook") or "").strip()
-
-                    # Nếu PSID chưa có tên & actor có => set vào user_facebook
-                    if target_idx is not None and actor and actor != "-" and not csv_name:
-                        rows2[target_idx]["user_facebook"] = actor
-                        save_psids_csv(rows2, commit_msg=f"fill fb name for {psid} from OCR")
-                        csv_name = actor
-
-                    cond_amount = (amount_val == 120000)
-                    cond_date   = bool(month_year and is_current_month_vn(*month_year))
-                    cond_name   = bool(csv_name and actor and names_match(csv_name, actor, threshold=0.66))
-
-                    if target_idx is not None and cond_amount and cond_date and cond_name:
+                    t_idx = next((i for i, r in enumerate(rows2) if r.get("psid") == psid), None)
+                    if t_idx is not None and money_ok and month_ok:
                         next1 = _first_day_next_month_vn()
-                        rows2[target_idx]["mute_until"] = next1.isoformat()
-                        if not rows2[target_idx].get("created_at_iso"):
-                            rows2[target_idx]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
-                        if save_psids_csv(rows2, commit_msg=f"auto mute {psid} until {next1.isoformat()}"):
-                            did_mute = True
-                            mute_until_str = next1.strftime("%d/%m/%Y")
+                        rows2[t_idx]["status"] = "1"
+                        rows2[t_idx]["mute_until"] = next1.isoformat()
+                        if not rows2[t_idx].get("created_at_iso"):
+                            rows2[t_idx]["created_at_iso"] = datetime.now(VN_TZ).isoformat(timespec="seconds")
+                        save_psids_csv(rows2, commit_msg=f"mark paid {psid} until {next1.isoformat()}")
+                        updated = True
 
-                    # === CHECKLIST ===
-                    def ok(v: bool) -> str:
-                        return "✅" if v else "❌"
-
-                    month_year_str = f"{month_year[0]:02d}/{month_year[1]}" if month_year else "-"
-
-                    # lấy lại dòng CSV hiện tại cho checklist
-                    rows_csv = load_psids_csv()
-                    csv_fb_now = ""
-                    csv_momo_now = ""
-                    for r in rows_csv:
-                        if r.get("psid") == psid:
-                            csv_fb_now = (r.get("user_facebook") or "").strip()
-                            csv_momo_now = (r.get("user_momo") or "").strip()
-                            break
-                    csv_name_now = csv_momo_now or csv_fb_now
-
-                    name_ok = bool(csv_name_now and actor and names_match(csv_name_now, actor, threshold=0.66))
-                    amount_ok = cond_amount
-                    date_ok   = cond_date
-                    mute_ok   = bool(did_mute)
-
+                    # ghép phản hồi
                     reply = (
                         "✅ KẾT QUẢ (MoMo)\n"
                         f"• Số tiền: {amt_text}\n"
-                        f"• Thời gian: {when_txt_display}\n"
+                        f"• Thời gian: {when_txt}\n"
                         f"• Người thực hiện: {actor}\n"
                         f"• Chi tiết: {detail}\n"
-                        "\n"
-                        "— Kiểm tra điều kiện —\n"
-                        f"{ok(name_ok)} Tên khớp (CSV: {csv_name_now or '-'})\n"
-                        f"{ok(amount_ok)} Số tiền = 120.000đ\n"
-                        f"{ok(date_ok)} Tháng hiện tại (từ ngày: {month_year_str})\n"
+                        f"(OCR ~{spent:.2f}s)"
                     )
-                    if not mute_ok:
-                        reply += "\nℹ️ Chưa đủ điều kiện dừng nhắc (cần đúng tên, 120.000đ, và tháng hiện tại)."
+                    if updated:
+                        reply += "\n\n🔔 Đã đánh dấu **ĐÃ ĐÓNG (status=1)** và dừng nhắc tới đầu tháng sau."
                     else:
-                        reply += f"\n🔕 ĐÃ DỪNG NHẮC đến {mute_until_str}."
+                        reply += "\n\nℹ️ Chưa đánh dấu đã đóng (cần 120.000đ và ngày thuộc **tháng hiện tại**)."
 
                     send_text(psid, reply)
+
                     processed_one = True
-                    # đánh dấu image_url đã xử lý để retry cùng URL không lặp
                     _processed_images[image_url] = time.time()
-                    break  # chỉ xử lý ảnh đầu tiên
+                    break
 
                 except Exception as e:
                     app.logger.exception("OCR failed: %s", e)
@@ -562,9 +414,8 @@ def webhook_receive():
                     processed_one = True
                     break
 
-            # Text “DỪNG” để mute tới đầu tháng sau
-            t = (text_in or "").strip().lower()
-            if t in {"dung", "dừng", "stop"}:
+            # Lệnh “DỪNG” để mute tới đầu tháng sau (không đổi status)
+            if text_in in {"dung", "dừng", "stop"}:
                 rows = load_psids_csv()
                 rows = upsert_row_by_psid(rows, psid, fb_name="")
                 next1 = _first_day_next_month_vn()
@@ -572,39 +423,78 @@ def webhook_receive():
                     if r.get("psid") == psid:
                         r["mute_until"] = next1.isoformat()
                         if not r.get("created_at_iso"):
-                            r["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
+                            r["created_at_iso"] = datetime.now(VN_TZ).isoformat(timespec="seconds")
                         break
                 save_psids_csv(rows, commit_msg=f"user requested stop until {next1.isoformat()}")
-                send_text(psid, f"Đã dừng nhắc đến {next1.strftime('%d/%m/%Y')}.")
+                send_text(psid, f"🔕 Đã dừng nhắc đến {next1.strftime('%d/%m/%Y')}.")
 
     return "ok", 200
 
-# ================= Cron gửi nhắc tuần =================
+# ================= Cron gửi nhắc tuần (24h window + status) =================
+def _parse_iso(s: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
 @app.post("/task/weekly")
 def task_weekly():
     if request.headers.get("X-CRON-SECRET") != CRON_SECRET:
         abort(403)
 
     rows = load_psids_csv()
-    today = _now_vn_date()
+    now_utc = datetime.now(timezone.utc)
+    today_vn = datetime.now(VN_TZ).date()
     sent = 0
     targets: List[str] = []
+
+    changed = False  # nếu có reset status/mute_until sang tháng mới thì lưu lại
 
     for r in rows:
         psid = (r.get("psid") or "").strip()
         if not psid:
             continue
+
+        # Nếu có mute_until mà đã qua -> sang tháng mới: reset status=0, clear mute_until
         mute_until = (r.get("mute_until") or "").strip()
         if mute_until:
             try:
                 mu = dt.date.fromisoformat(mute_until)
-                if mu >= today:
+                if mu < today_vn:
+                    if (r.get("status") or "0") == "1" or r.get("mute_until"):
+                        r["status"] = "0"
+                        r["mute_until"] = ""
+                        changed = True
+            except Exception:
+                pass
+
+        # BỎ QUA nếu status=1 (đã đóng trong tháng này)
+        if (r.get("status") or "0") == "1":
+            continue
+
+        # MUTE check còn hiệu lực
+        mute_until = (r.get("mute_until") or "").strip()
+        if mute_until:
+            try:
+                mu = dt.date.fromisoformat(mute_until)
+                if mu >= today_vn:
                     continue  # đang mute
             except Exception:
                 pass
+
+        # 24h window check
+        last_iso = (r.get("last_user_msg_iso") or "").strip()
+        last_dt = _parse_iso(last_iso)
+        if not last_dt or (now_utc - last_dt) > timedelta(hours=24):
+            continue  # ngoài 24h thì KHÔNG gửi
+
         targets.append(psid)
 
-    msg = f"Nhắc đóng quỹ 120.000đ tháng này ({today.strftime('%m/%Y')}). Gửi ảnh MoMo để hệ thống tự dừng nhắc."
+    if changed:
+        save_psids_csv(rows, commit_msg="auto reset status/mute at new month")
+
+    msg = f"Nhắc đóng quỹ 120.000đ tháng này ({datetime.now(VN_TZ):%m/%Y}). " \
+          f"Gửi ảnh MoMo để hệ thống tự đánh dấu đã đóng."
     for p in targets:
         try:
             send_text(p, msg)
@@ -613,7 +503,7 @@ def task_weekly():
         except Exception as e:
             app.logger.exception(f"Send failed for {p}: {e}")
 
-    return jsonify({"sent": sent, "eligible": len(targets), "date_vn": today.isoformat()})
+    return jsonify({"sent": sent, "eligible": len(targets), "targets": targets})
 
 # ================= Main =================
 if __name__ == "__main__":
