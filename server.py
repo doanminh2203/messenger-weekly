@@ -310,7 +310,7 @@ def webhook_receive():
                         did_mute = False
                         mute_until_str = ""
 
-                        if amount_val == 120000 and month_year and is_current_month_vn(*month_year):
+                        if amount_val == 120000:
                             # tìm hàng trong CSV có name trùng với actor (không dấu)
                             rows2 = load_psids_csv()
                             actor_norm = norm_name(actor)
