@@ -361,7 +361,7 @@ def webhook_receive():
                     # ---- kiểm tra điều kiện 'đã đóng' ----
                     # 1) số tiền
                     amount_val = parse_amount_to_int(amt_text)
-                    money_ok = (amount_val == 120000)
+                    money_ok = (amount_val >= 120000)
 
                     # 2) ngày thuộc tháng hiện tại (tìm dd/mm/yyyy trong when_txt hoặc trong các line)
                     month_ok = False
@@ -494,7 +494,7 @@ def task_weekly():
         save_psids_csv(rows, commit_msg="auto reset status/mute at new month")
 
     msg = f"Nhắc đóng quỹ 120.000đ tháng này ({datetime.now(VN_TZ):%m/%Y}). " \
-          f"Gửi ảnh MoMo để hệ thống tự đánh dấu đã đóng."
+          f"Gửi ảnh MoMo để hệ thống tự đánh dấu đã đóng. Gửi 'Dừng' để tạm thời không nhân thông báo!"
     for p in targets:
         try:
             send_text(p, msg)
