@@ -443,58 +443,33 @@ def task_weekly():
         abort(403)
 
     rows = load_psids_csv()
-    now_utc = datetime.now(timezone.utc)
-    today_vn = datetime.now(VN_TZ).date()
+    today = _now_vn_date()
     sent = 0
     targets: List[str] = []
-
-    changed = False  # nếu có reset status/mute_until sang tháng mới thì lưu lại
 
     for r in rows:
         psid = (r.get("psid") or "").strip()
         if not psid:
             continue
 
-        # Nếu có mute_until mà đã qua -> sang tháng mới: reset status=0, clear mute_until
-        mute_until = (r.get("mute_until") or "").strip()
-        if mute_until:
-            try:
-                mu = dt.date.fromisoformat(mute_until)
-                if mu < today_vn:
-                    if (r.get("status") or "0") == "1" or r.get("mute_until"):
-                        r["status"] = "0"
-                        r["mute_until"] = ""
-                        changed = True
-            except Exception:
-                pass
-
-        # BỎ QUA nếu status=1 (đã đóng trong tháng này)
-        if (r.get("status") or "0") == "1":
+        # 1) Bỏ qua nếu đã đóng (status == "1")
+        status = (r.get("status") or "0").strip()
+        if status == "1":
             continue
 
-        # MUTE check còn hiệu lực
+        # 2) Bỏ qua nếu đang mute
         mute_until = (r.get("mute_until") or "").strip()
         if mute_until:
             try:
                 mu = dt.date.fromisoformat(mute_until)
-                if mu >= today_vn:
-                    continue  # đang mute
+                if mu >= today:
+                    continue
             except Exception:
                 pass
-
-        # 24h window check
-        last_iso = (r.get("last_user_msg_iso") or "").strip()
-        last_dt = _parse_iso(last_iso)
-        if not last_dt or (now_utc - last_dt) > timedelta(hours=24):
-            continue  # ngoài 24h thì KHÔNG gửi
 
         targets.append(psid)
 
-    if changed:
-        save_psids_csv(rows, commit_msg="auto reset status/mute at new month")
-
-    msg = f"Nhắc đóng quỹ 120.000đ tháng này ({datetime.now(VN_TZ):%m/%Y}). " \
-          f"Gửi ảnh MoMo để hệ thống tự đánh dấu đã đóng. Gửi 'Dừng' để tạm thời không nhân thông báo!"
+    msg = f"Nhắc đóng quỹ 120.000đ tháng này ({today.strftime('%m/%Y')}). Gửi ảnh MoMo để hệ thống tự dừng nhắc."
     for p in targets:
         try:
             send_text(p, msg)
@@ -503,7 +478,9 @@ def task_weekly():
         except Exception as e:
             app.logger.exception(f"Send failed for {p}: {e}")
 
-    return jsonify({"sent": sent, "eligible": len(targets), "targets": targets})
+    return jsonify({"sent": sent, "eligible": len(targets), "date_vn": today.isoformat()})
+
+    
 
 # ================= Main =================
 if __name__ == "__main__":
