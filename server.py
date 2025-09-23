@@ -509,7 +509,6 @@ def webhook_receive():
                     preview_lines = "\n".join(lines[:20])
                     if len(preview_lines) > 1200:
                         preview_lines = preview_lines[:1200] + "…"
-                    reply += f"\n\n[DEBUG] OCR lines ({len(lines)}):\n{preview_lines}"
 
                     send_text(psid, reply)
                     processed_one = True
