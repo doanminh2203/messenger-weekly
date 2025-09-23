@@ -443,44 +443,94 @@ def task_weekly():
         abort(403)
 
     rows = load_psids_csv()
-    today = _now_vn_date()
+
+    # dùng dt.* cho đồng nhất imports
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    today_vn = dt.datetime.now(VN_TZ).date()
+
     sent = 0
     targets: List[str] = []
+    changed = False  # nếu có reset status/mute_until sang tháng mới thì lưu lại
 
     for r in rows:
         psid = (r.get("psid") or "").strip()
         if not psid:
             continue
 
-        # 1) Bỏ qua nếu đã đóng (status == "1")
-        status = (r.get("status") or "0").strip()
-        if status == "1":
-            continue
+        # ==== Reset đầu tháng (phòng hờ) ====
+        # Nếu đã qua tháng mới và row đang "đã đóng" nhưng KHÔNG có mute_until (do cập nhật thủ công),
+        # thì reset status về 0 để không treo mãi.
+        try:
+            if today_vn.day == 1 and (r.get("status") or "0") == "1" and not (r.get("mute_until") or "").strip():
+                r["status"] = "0"
+                changed = True
+        except Exception:
+            pass
 
-        # 2) Bỏ qua nếu đang mute
+        # ==== Reset khi hết mute_until (cơ chế chính) ====
         mute_until = (r.get("mute_until") or "").strip()
         if mute_until:
             try:
                 mu = dt.date.fromisoformat(mute_until)
-                if mu >= today:
-                    continue
+                # Nếu đã qua ngày mute → coi như sang kỳ mới: reset status về 0 và xóa mute_until
+                if mu < today_vn:
+                    if (r.get("status") or "0") == "1" or r.get("mute_until"):
+                        r["status"] = "0"
+                        r["mute_until"] = ""
+                        changed = True
             except Exception:
                 pass
 
+        # ==== BỎ QUA nếu status=1 (đã đóng trong tháng này) ====
+        if (r.get("status") or "0") == "1":
+            continue
+
+        # ==== BỎ QUA nếu đang còn mute_until hiệu lực ====
+        mute_until = (r.get("mute_until") or "").strip()
+        if mute_until:
+            try:
+                mu = dt.date.fromisoformat(mute_until)
+                if mu >= today_vn:
+                    continue  # vẫn đang mute
+            except Exception:
+                pass
+
+        # ==== 24h window (chỉ gửi nếu user có tương tác trong 24h qua) ====
+        last_iso = (r.get("last_user_msg_iso") or "").strip()
+        try:
+            last_dt = dt.datetime.fromisoformat(last_iso) if last_iso else None
+        except Exception:
+            last_dt = None
+
+        # Chỉ GỬI nếu có last_dt và (now_utc - last_dt) <= 24h
+        if (not last_dt) or ((now_utc - last_dt) > dt.timedelta(hours=24)):
+            continue
+
         targets.append(psid)
 
-    msg = f"Nhắc đóng quỹ 120.000đ tháng này ({today.strftime('%m/%Y')}). Gửi ảnh MoMo để hệ thống tự dừng nhắc."
+    if changed:
+        save_psids_csv(rows, commit_msg="auto reset status/mute at new month")
+
+    msg = (
+        f"Nhắc đóng quỹ 120.000đ tháng này ({dt.datetime.now(VN_TZ):%m/%Y}). "
+        f"Gửi ảnh MoMo để hệ thống tự đánh dấu đã đóng. Gửi 'Dừng' để tạm thời không nhận thông báo!"
+    )
+
     for p in targets:
         try:
             send_text(p, msg)
             sent += 1
-            time.sleep(0.2)
+            time.sleep(0.2)  # nhẹ tránh rate limit
         except Exception as e:
             app.logger.exception(f"Send failed for {p}: {e}")
 
-    return jsonify({"sent": sent, "eligible": len(targets), "date_vn": today.isoformat()})
+    return jsonify({
+        "sent": sent,
+        "eligible": len(targets),
+        "targets": targets,
+        "today_vn": today_vn.isoformat()
+    })
 
-    
 
 # ================= Main =================
 if __name__ == "__main__":
