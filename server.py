@@ -9,7 +9,7 @@ import logging
 import datetime as dt
 from io import StringIO
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, abort, jsonify
@@ -41,7 +41,7 @@ GH_TOKEN        = os.getenv("GH_TOKEN", "")
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
-# THÊM cột 'status' (1=đã đóng, 0=chưa)
+# Cột 'status' (1=đã đóng, 0=chưa)
 CSV_HEADERS = [
     "psid", "user_facebook", "user_momo",
     "mute_until", "created_at_iso", "last_user_msg_iso",
@@ -140,9 +140,8 @@ def load_psids_csv() -> List[Dict[str, str]]:
         f = StringIO(text)
         reader = csv.DictReader(f)
         for r in reader:
-            # fill missing keys with defaults
             row = {h: (r.get(h, "") or "").strip() for h in CSV_HEADERS}
-            if "status" not in r:
+            if not row.get("status"):
                 row["status"] = "0"
             rows.append(row)
     except Exception as e:
@@ -361,14 +360,13 @@ def webhook_receive():
                     # ---- kiểm tra điều kiện 'đã đóng' ----
                     # 1) số tiền
                     amount_val = parse_amount_to_int(amt_text)
-                    money_ok = (amount_val >= 120000)
+                    money_ok = (amount_val is not None and amount_val >= 120000)
 
                     # 2) ngày thuộc tháng hiện tại (tìm dd/mm/yyyy trong when_txt hoặc trong các line)
                     month_ok = False
                     date_found = None
                     hit = extract_strict_slash_date_from_text(when_txt)
                     if not hit:
-                        # fallback: quét các dòng OCR
                         text_join = "\n".join(lines)
                         hit = extract_strict_slash_date_from_text(text_join)
                     if hit:
@@ -388,7 +386,6 @@ def webhook_receive():
                         save_psids_csv(rows2, commit_msg=f"mark paid {psid} until {next1.isoformat()}")
                         updated = True
 
-                    # ghép phản hồi
                     reply = (
                         "✅ KẾT QUẢ (MoMo)\n"
                         f"• Số tiền: {amt_text}\n"
@@ -430,7 +427,7 @@ def webhook_receive():
 
     return "ok", 200
 
-# ================= Cron gửi nhắc tuần (24h window + status) =================
+# ================= Cron gửi nhắc tuần (reset đầu tháng + 24h window + status) =================
 def _parse_iso(s: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(s)
@@ -443,36 +440,27 @@ def task_weekly():
         abort(403)
 
     rows = load_psids_csv()
-
-    # dùng dt.* cho đồng nhất imports
-    now_utc = dt.datetime.now(dt.timezone.utc)
     today_vn = dt.datetime.now(VN_TZ).date()
+    now_utc = dt.datetime.now(dt.timezone.utc)
 
     sent = 0
     targets: List[str] = []
-    changed = False  # nếu có reset status/mute_until sang tháng mới thì lưu lại
+    changed = False
 
-    for r in rows:
-        psid = (r.get("psid") or "").strip()
-        if not psid:
-            continue
-
-        # ==== Reset đầu tháng (phòng hờ) ====
-        # Nếu đã qua tháng mới và row đang "đã đóng" nhưng KHÔNG có mute_until (do cập nhật thủ công),
-        # thì reset status về 0 để không treo mãi.
-        try:
-            if today_vn.day == 1 and (r.get("status") or "0") == "1" and not (r.get("mute_until") or "").strip():
+    # ==== RESET ĐẦU THÁNG: status=0 và clear mute_until cho TẤT CẢ hàng ====
+    if today_vn.day == 1:
+        for r in rows:
+            if (r.get("status") or "0") != "0" or (r.get("mute_until") or ""):
                 r["status"] = "0"
+                r["mute_until"] = ""
                 changed = True
-        except Exception:
-            pass
 
-        # ==== Reset khi hết mute_until (cơ chế chính) ====
-        mute_until = (r.get("mute_until") or "").strip()
-        if mute_until:
+    # ==== Reset khi hết mute_until (phòng hờ) ====
+    for r in rows:
+        mu_str = (r.get("mute_until") or "").strip()
+        if mu_str:
             try:
-                mu = dt.date.fromisoformat(mute_until)
-                # Nếu đã qua ngày mute → coi như sang kỳ mới: reset status về 0 và xóa mute_until
+                mu = dt.date.fromisoformat(mu_str)
                 if mu < today_vn:
                     if (r.get("status") or "0") == "1" or r.get("mute_until"):
                         r["status"] = "0"
@@ -481,35 +469,37 @@ def task_weekly():
             except Exception:
                 pass
 
-        # ==== BỎ QUA nếu status=1 (đã đóng trong tháng này) ====
+    # Lưu nếu có thay đổi
+    if changed:
+        save_psids_csv(rows, commit_msg="reset status=0 & clear mute_until at start/new month")
+
+    # ==== Lọc danh sách gửi ====
+    for r in rows:
+        psid = (r.get("psid") or "").strip()
+        if not psid:
+            continue
+
+        # BỎ QUA nếu status=1 (đã đóng trong tháng này)
         if (r.get("status") or "0") == "1":
             continue
 
-        # ==== BỎ QUA nếu đang còn mute_until hiệu lực ====
-        mute_until = (r.get("mute_until") or "").strip()
-        if mute_until:
+        # BỎ QUA nếu đang mute
+        mu_str = (r.get("mute_until") or "").strip()
+        if mu_str:
             try:
-                mu = dt.date.fromisoformat(mute_until)
+                mu = dt.date.fromisoformat(mu_str)
                 if mu >= today_vn:
-                    continue  # vẫn đang mute
+                    continue
             except Exception:
                 pass
 
-        # ==== 24h window (chỉ gửi nếu user có tương tác trong 24h qua) ====
+        # Chỉ gửi nếu user có tương tác trong 24h qua
         last_iso = (r.get("last_user_msg_iso") or "").strip()
-        try:
-            last_dt = dt.datetime.fromisoformat(last_iso) if last_iso else None
-        except Exception:
-            last_dt = None
-
-        # Chỉ GỬI nếu có last_dt và (now_utc - last_dt) <= 24h
+        last_dt = _parse_iso(last_iso) if last_iso else None
         if (not last_dt) or ((now_utc - last_dt) > dt.timedelta(hours=24)):
             continue
 
         targets.append(psid)
-
-    if changed:
-        save_psids_csv(rows, commit_msg="auto reset status/mute at new month")
 
     msg = (
         f"Nhắc đóng quỹ 120.000đ tháng này ({dt.datetime.now(VN_TZ):%m/%Y}). "
@@ -520,7 +510,7 @@ def task_weekly():
         try:
             send_text(p, msg)
             sent += 1
-            time.sleep(0.2)  # nhẹ tránh rate limit
+            time.sleep(0.2)  # tránh rate limit
         except Exception as e:
             app.logger.exception(f"Send failed for {p}: {e}")
 
@@ -530,7 +520,6 @@ def task_weekly():
         "targets": targets,
         "today_vn": today_vn.isoformat()
     })
-
 
 # ================= Main =================
 if __name__ == "__main__":
