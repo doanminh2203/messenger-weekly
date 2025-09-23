@@ -213,27 +213,73 @@ def upsert_row_by_psid(rows: List[Dict[str, str]], psid: str, fb_name: str) -> L
         })
     return rows
 
-# ================= Name/Amount matching =================
+# ================= Name/Amount matching (thuần loop + if/else) =================
 import unicodedata
-from rapidfuzz.fuzz import partial_ratio, ratio
 
 def _strip_accents(s: str) -> str:
     s_norm = unicodedata.normalize("NFD", s or "")
     s_no = "".join(ch for ch in s_norm if unicodedata.category(ch) != "Mn")
     return unicodedata.normalize("NFC", s_no)
 
-def norm_name(s: str) -> str:
+def norm_name_spaces(s: str) -> str:
+    """Bỏ dấu, lower, rút gọn khoảng trắng, chỉ giữ chữ/số/khoảng trắng."""
     s2 = _strip_accents(s).lower().strip()
     s2 = re.sub(r"\s+", " ", s2)
+    s2 = re.sub(r"[^a-z0-9 ]+", "", s2)
     return s2
 
-def names_match(a: str, b: str) -> bool:
-    na, nb = norm_name(a), norm_name(b)
-    if not na or not nb:
+def norm_name_nospace(s: str) -> str:
+    return norm_name_spaces(s).replace(" ", "")
+
+def subseq_match_ratio(shorter: str, longer: str) -> float:
+    """Tỷ lệ ký tự của 'shorter' xuất hiện theo thứ tự trong 'longer' (subsequence)."""
+    if not shorter:
+        return 0.0
+    i = j = 0
+    m, n = len(shorter), len(longer)
+    matched = 0
+    while i < m and j < n:
+        if shorter[i] == longer[j]:
+            matched += 1
+            i += 1
+            j += 1
+        else:
+            j += 1
+    return matched / m
+
+def token_coverage_ratio(a_spaces: str, b_spaces: str) -> float:
+    """Tỷ lệ số từ trong a_spaces xuất hiện như substring trong b_spaces."""
+    a_tokens = [t for t in a_spaces.split(" ") if t]
+    if not a_tokens:
+        return 0.0
+    hits = 0
+    for tok in a_tokens:
+        if tok and tok in b_spaces:
+            hits += 1
+    return hits / len(a_tokens)
+
+def names_match(csv_name: str, actor: str, threshold: float = 0.66) -> bool:
+    """
+    So khớp nới lỏng:
+    - subsequence ký tự (không khoảng trắng) >= threshold
+    - HOẶC tỷ lệ từ xuất hiện >= threshold
+    """
+    a_sp = norm_name_spaces(csv_name)
+    b_sp = norm_name_spaces(actor)
+    a_ns = a_sp.replace(" ", "")
+    b_ns = b_sp.replace(" ", "")
+
+    if not a_ns or not b_ns:
         return False
-    if na == nb or na in nb or nb in na:
+
+    char_ratio = subseq_match_ratio(a_ns, b_ns)
+    token_ratio = token_coverage_ratio(a_sp, b_sp)
+
+    if char_ratio >= threshold:
         return True
-    return partial_ratio(na, nb) >= 90 or ratio(na, nb) >= 85
+    if token_ratio >= threshold:
+        return True
+    return False
 
 def parse_amount_to_int(amount_text: Optional[str]) -> Optional[int]:
     if not amount_text:
@@ -363,14 +409,13 @@ def webhook_receive():
 
                 # nếu lần đầu thấy mid thì đánh dấu mid; nếu không có mid thì chống trùng theo url
                 if mid:
-                    # mid đã được seen_mid ở trên (để skip sớm). ở đây chỉ đánh dấu lần nữa để chắc chắn
-                    _processed_mids[mid] = time.time()
+                    _processed_mids[mid] = time.time()  # đánh dấu
                 else:
                     if seen_image(image_url):
                         app.logger.info("Skip duplicate by image_url=%s", image_url)
                         continue
 
-                # Đã xử lý 1 ảnh rồi thì dừng (tránh gửi nhiều lần nếu có nhiều image trong cùng message)
+                # Đã xử lý 1 ảnh rồi thì dừng
                 if processed_one:
                     break
 
@@ -455,7 +500,7 @@ def webhook_receive():
 
                     cond_amount = (amount_val == 120000)
                     cond_date   = bool(month_year and is_current_month_vn(*month_year))
-                    cond_name   = bool(csv_name and actor and names_match(csv_name, actor))
+                    cond_name   = bool(csv_name and actor and names_match(csv_name, actor, threshold=0.66))
 
                     if target_idx is not None and cond_amount and cond_date and cond_name:
                         next1 = _first_day_next_month_vn()
@@ -474,20 +519,16 @@ def webhook_receive():
 
                     # lấy lại dòng CSV hiện tại cho checklist
                     rows_csv = load_psids_csv()
-                    row_ok = False
                     csv_fb_now = ""
                     csv_momo_now = ""
                     for r in rows_csv:
                         if r.get("psid") == psid:
-                            row_ok = True
                             csv_fb_now = (r.get("user_facebook") or "").strip()
                             csv_momo_now = (r.get("user_momo") or "").strip()
                             break
                     csv_name_now = csv_momo_now or csv_fb_now
-                    try:
-                        name_ok = bool(csv_name_now and actor and names_match(csv_name_now, actor))
-                    except Exception:
-                        name_ok = bool(csv_name_now and actor and (csv_name_now.strip().lower() == actor.strip().lower()))
+
+                    name_ok = bool(csv_name_now and actor and names_match(csv_name_now, actor, threshold=0.66))
                     amount_ok = cond_amount
                     date_ok   = cond_date
                     mute_ok   = bool(did_mute)
@@ -498,16 +539,16 @@ def webhook_receive():
                         f"• Thời gian: {when_txt_display}\n"
                         f"• Người thực hiện: {actor}\n"
                         f"• Chi tiết: {detail}\n"
+                        "\n"
+                        "— Kiểm tra điều kiện —\n"
+                        f"{ok(name_ok)} Tên khớp (CSV: {csv_name_now or '-'})\n"
+                        f"{ok(amount_ok)} Số tiền = 120.000đ\n"
+                        f"{ok(date_ok)} Tháng hiện tại (từ ngày: {month_year_str})\n"
                     )
                     if not mute_ok:
-                        reply += "\n\nℹ️ Chưa đủ điều kiện dừng nhắc (cần đúng tên, 120.000đ, và tháng hiện tại)."
+                        reply += "\nℹ️ Chưa đủ điều kiện dừng nhắc (cần đúng tên, 120.000đ, và tháng hiện tại)."
                     else:
-                        reply += f"\n\n🔕 Đã dừng nhắc đến {mute_until_str}."
-
-                    # debug lines (giới hạn ~20 dòng)
-                    preview_lines = "\n".join(lines[:20])
-                    if len(preview_lines) > 1200:
-                        preview_lines = preview_lines[:1200] + "…"
+                        reply += f"\n🔕 ĐÃ DỪNG NHẮC đến {mute_until_str}."
 
                     send_text(psid, reply)
                     processed_one = True
