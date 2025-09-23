@@ -1,34 +1,33 @@
 # server.py
 import os
 import io
+import re
 import csv
 import json
 import time
 import base64
 import logging
+import unicodedata
 import datetime as dt
 from typing import List, Dict, Tuple, Optional
 from zoneinfo import ZoneInfo
-from ocr_fast import fast_extract_amount_date_actor_detail
 
 import requests
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 
-# ====== OCR nhanh (phụ thuộc file ocr_fast.py trong repo) ======
+# ====== OCR nhanh (file ocr_fast.py trong repo) ======
 try:
-    # YÊU CẦU: ocr_fast.py phải có hàm này, trả về dict:
+    # Kỳ vọng trả về:
     # {
-    #   "amount_text": "120.000đ",     # hoặc "120000"
-    #   "amount_value": 120000,        # int hoặc None
+    #   "amount_text": "120.000đ", "amount_value": 120000,
     #   "when_text": "22:25-22/09/2025",
     #   "actor": "Doan Nhat Minh",
-    #   "detail": "Gop vao quy",       # có thể None
-    #   "lines": ["...","..."],        # list dòng OCR (debug)
-    #   "spent": 12.34                 # giây
+    #   "detail": "Gop vao quy",
+    #   "lines": [...], "spent": 12.3
     # }
     from ocr_fast import fast_extract_amount_date_actor_detail
-except Exception:  # fallback an toàn nếu thiếu file
+except Exception:
     def fast_extract_amount_date_actor_detail(image_url: str, timeout: int = 30):
         return {
             "amount_text": None,
@@ -42,15 +41,13 @@ except Exception:  # fallback an toàn nếu thiếu file
 
 # ====== ENV ======
 load_dotenv()
-
 PAGE_TOKEN       = os.getenv("PAGE_TOKEN")
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "changeme")
 CRON_SECRET      = os.getenv("CRON_SECRET", "secret")
 TEST_PSIDS       = [p.strip() for p in os.getenv("TEST_PSIDS", "").split(",") if p.strip()]
 
-# CSV đọc (raw) — ví dụ: https://raw.githubusercontent.com/<owner>/<repo>/main/psids.csv
+# CSV đọc (raw)
 PSIDS_CSV_URL    = os.getenv("PSIDS_CSV_URL", "")
-
 # CSV ghi qua GitHub API
 GH_OWNER         = os.getenv("GH_OWNER")
 GH_REPO          = os.getenv("GH_REPO")
@@ -66,16 +63,15 @@ logging.basicConfig(level=logging.INFO)
 log = app.logger
 log.setLevel(logging.INFO)
 
-# ====== Chống trả lời trùng ảnh (mid) trong vòng đời process ======
+# ====== Chống trả lời trùng ảnh (mid) ======
 SEEN_MIDS = set()
-MAX_SEEN = 5000  # giới hạn bộ nhớ
+MAX_SEEN = 5000
 
 def seen_mid(mid: str) -> bool:
     if not mid:
         return False
     if mid in SEEN_MIDS:
         return True
-    # làm sạch khi lớn
     if len(SEEN_MIDS) > MAX_SEEN:
         SEEN_MIDS.clear()
     SEEN_MIDS.add(mid)
@@ -83,7 +79,6 @@ def seen_mid(mid: str) -> bool:
 
 # ====== Utils gửi tin ======
 def send_text(psid: str, text: str):
-    """Gửi tin nhắn văn bản tới 1 PSID bằng Send API."""
     if not PAGE_TOKEN:
         log.error("PAGE_TOKEN missing; cannot send messages")
         return
@@ -108,14 +103,13 @@ def _gh_headers():
     }
 
 def gh_get_contents():
-    """Lấy nội dung file + sha trên nhánh GH_BRANCH."""
     if not all([GH_OWNER, GH_REPO, GH_BRANCH, GH_FILE_PATH, GH_TOKEN]):
         raise RuntimeError("Missing GitHub env vars for write: GH_*")
     url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{GH_FILE_PATH}"
     params = {"ref": GH_BRANCH}
     r = requests.get(url, headers=_gh_headers(), params=params, timeout=20)
     if r.status_code == 404:
-        return {"sha": None, "content": ""}  # file chưa tồn tại
+        return {"sha": None, "content": ""}
     r.raise_for_status()
     data = r.json()
     content_b64 = data.get("content", "")
@@ -124,7 +118,6 @@ def gh_get_contents():
     return {"sha": sha, "content": content}
 
 def gh_put_contents(new_text: str, sha: Optional[str], message: str):
-    """Ghi (create/update) file CSV qua GitHub API."""
     if not all([GH_OWNER, GH_REPO, GH_BRANCH, GH_FILE_PATH, GH_TOKEN]):
         raise RuntimeError("Missing GitHub env vars for write: GH_*")
     url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{GH_FILE_PATH}"
@@ -142,16 +135,13 @@ def gh_put_contents(new_text: str, sha: Optional[str], message: str):
     return r.json()
 
 def load_psids_csv() -> List[Dict[str, str]]:
-    """Đọc CSV từ GH (ghi) nếu có token; nếu không, fallback PSIDS_CSV_URL (raw)."""
     text = ""
-    # Ưu tiên lấy qua API (để chắc chắn sync với ghi)
     if all([GH_OWNER, GH_REPO, GH_BRANCH, GH_FILE_PATH, GH_TOKEN]):
         try:
             obj = gh_get_contents()
             text = obj.get("content", "")
         except Exception as e:
             log.exception(f"Failed gh_get_contents: {e}")
-    # Fallback: PSIDS_CSV_URL (raw)
     if not text and PSIDS_CSV_URL:
         try:
             r = requests.get(PSIDS_CSV_URL, timeout=15)
@@ -166,39 +156,32 @@ def load_psids_csv() -> List[Dict[str, str]]:
     f = io.StringIO(text)
     reader = csv.DictReader(f)
     for row in reader:
-        # đảm bảo đủ field
         fixed = {k: (row.get(k) or "").strip() for k in CSV_FIELDS}
         rows.append(fixed)
     return rows
 
 def save_psids_csv(rows: List[Dict[str, str]], commit_msg: str):
-    """Ghi CSV lên GitHub (yêu cầu GH_*)."""
     if not all([GH_OWNER, GH_REPO, GH_BRANCH, GH_FILE_PATH, GH_TOKEN]):
         log.warning("Skip save_psids_csv: missing GH_* envs")
         return
-    # đóng gói CSV
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=CSV_FIELDS, lineterminator="\n")
     writer.writeheader()
     for r in rows:
         writer.writerow({k: r.get(k, "") for k in CSV_FIELDS})
     new_text = out.getvalue()
-    # lấy sha hiện tại
     meta = gh_get_contents()
     sha = meta.get("sha")
     gh_put_contents(new_text, sha, commit_msg)
 
 def ensure_psid_row(psid: str, user_facebook: Optional[str] = None):
-    """Đảm bảo PSID có mặt trong CSV, nếu thiếu thì thêm mới."""
     rows = load_psids_csv()
     for r in rows:
         if r.get("psid") == psid:
-            # fill user_facebook nếu trống
             if user_facebook and not (r.get("user_facebook") or "").strip():
                 r["user_facebook"] = user_facebook
                 save_psids_csv(rows, commit_msg=f"fill user_facebook for {psid}")
             return
-    # thêm mới
     now_iso = dt.datetime.now(dt.timezone.utc).astimezone(VN_TZ).isoformat(timespec="seconds")
     rows.append({
         "psid": psid,
@@ -221,67 +204,66 @@ def update_last_paid_month(psid: str, yyyymm: str):
     if changed:
         save_psids_csv(rows, commit_msg=f"set last_paid_month={yyyymm} for {psid}")
 
-# ====== Chuẩn hoá & match tên (>=67%) ======
-from rapidfuzz import fuzz
-from rapidfuzz.distance import Levenshtein
-
-def norm_name(s: str) -> str:
+# ====== Chuẩn hoá & so khớp tên theo từng ký tự (LCS) ======
+def strip_accents(s: str) -> str:
     if not s:
         return ""
-    s = s.strip().lower()
-    # chuẩn hoá khoảng trắng và bỏ dấu cách dư
-    s = " ".join(s.split())
-    # thay một số ký tự đặc biệt thường gặp
-    repl = {
-        "đ": "d",
-        "…": "",
-        "•": "",
-        "’": "'",
-        "–": "-",
-        "—": "-",
-    }
-    for k, v in repl.items():
-        s = s.replace(k, v)
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+def norm_name(s: str) -> str:
+    """Lower, bỏ dấu, chỉ giữ a-z0-9 + space, gọn khoảng trắng."""
+    if not s:
+        return ""
+    s = strip_accents(s.lower())
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def names_match(a: str, b: str) -> bool:
-    """
-    So khớp tên chịu lỗi OCR: đạt nếu similarity >= 67% (≈ 2/3 ký tự đúng).
-    Dùng nhiều thước đo để bền hơn với khoảng trắng/lỗi nhỏ.
-    """
-    na, nb = norm_name(a), norm_name(b)
+def lcs_length(a: str, b: str) -> int:
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return 0
+    dp = [0] * (m + 1)
+    for i in range(1, n + 1):
+        prev = 0
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            tmp = dp[j]
+            if ai == b[j - 1]:
+                dp[j] = prev + 1
+            else:
+                dp[j] = dp[j] if dp[j] >= dp[j - 1] else dp[j - 1]
+            prev = tmp
+    return dp[m]
+
+def char_similarity(a: str, b: str) -> float:
+    """Similarity = LCS( bỏ space ) / max(len)."""
+    na = norm_name(a).replace(" ", "")
+    nb = norm_name(b).replace(" ", "")
     if not na or not nb:
-        return False
-    if na == nb:
-        return True
-    sims = [
-        fuzz.ratio(na, nb),
-        fuzz.partial_ratio(na, nb),
-        fuzz.token_set_ratio(na, nb),
-        fuzz.token_sort_ratio(na, nb),
-        int(100 * Levenshtein.normalized_similarity(na, nb)),
-    ]
-    best = max(sims)
-    return best >= 67
+        return 0.0
+    l = lcs_length(na, nb)
+    return l / max(len(na), len(nb))
+
+def names_match(a: str, b: str, threshold: float = 0.67) -> bool:
+    return char_similarity(a, b) >= threshold
 
 # ====== Ngày tháng VN hiện tại ======
 def parse_ddmmyyyy_from_text(t: Optional[str]) -> Optional[Tuple[int, int, int]]:
-    """Tìm dd/mm/yyyy trong chuỗi."""
     if not t:
         return None
-    # tìm pattern dd/mm/yyyy
-    # không dùng regex module ngoài để đơn giản, tách thủ công:
-    import re
     m = re.search(r'(\b\d{1,2})/(\d{1,2})/(\d{4}\b)', t)
     if not m:
         return None
     try:
         d = int(m.group(1))
-        mth = int(m.group(2))
+        mm = int(m.group(2))
         y = int(m.group(3))
-        # kiểm tra hợp lệ đơn giản
-        dt.date(y, mth, d)
-        return (d, mth, y)
+        dt.date(y, mm, d)
+        return (d, mm, y)
     except Exception:
         return None
 
@@ -308,7 +290,7 @@ def webhook_verify():
 @app.post("/webhook")
 def webhook_receive():
     raw = request.get_data(as_text=True)
-    log.info(f"RAW BODY: {raw[:1000]}")  # tránh log quá dài
+    log.info(f"RAW BODY: {raw[:1000]}")
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or data.get("object") != "page":
@@ -329,42 +311,42 @@ def webhook_receive():
                 try:
                     send_text(
                         psid,
-                        "Chào bạn! Bạn đã bắt đầu trò chuyện.\n"
-                        "Khi gửi ảnh sao kê MoMo, mình sẽ đọc số tiền, thời gian, người thực hiện và chi tiết.\n"
-                        "Nếu trùng tên MoMo trong CSV + đúng 120.000đ + thuộc tháng hiện tại, mình sẽ dừng nhắc đến đầu tháng sau."
+                        "Chào bạn! Gửi ảnh MoMo, mình sẽ đọc số tiền / thời gian / người thực hiện / chi tiết.\n"
+                        "Nếu tên trùng với 'user_momo' trong CSV (≈≥67%), số tiền = 120.000đ và ngày thuộc tháng hiện tại,"
+                        " mình sẽ dừng nhắc tới đầu tháng sau."
                     )
                 except Exception as e:
                     log.exception(f"Send GET_STARTED failed: {e}")
                 continue
 
-            # Nhận ảnh -> OCR
             message = evt.get("message") or {}
             mid = message.get("mid")
             atts = message.get("attachments") or []
 
-            # chống gửi trùng (một mid chỉ trả lời 1 lần)
+            # chống gửi lặp
             if mid and seen_mid(mid):
                 log.info(f"Skip duplicate mid={mid}")
                 continue
 
-            # nếu có ảnh
+            # nếu không có ảnh: lưu text làm user_facebook (nếu hợp lệ)
+            if not atts:
+                text = (message.get("text") or "").strip()
+                if text:
+                    ensure_psid_row(psid, user_facebook=text if len(text) >= 3 else None)
+                continue
+
+            # lấy ảnh đầu tiên
             img_url = None
             for a in atts:
                 if (a.get("type") == "image") and ((a.get("payload") or {}).get("url")):
                     img_url = a["payload"]["url"]
                     break
-
             if not img_url:
-                # không có ảnh => nếu là text có thể cập nhật tên FB
-                text = (message.get("text") or "").strip()
-                if text:
-                    # lưu PSID + user_facebook nếu trống
-                    ensure_psid_row(psid, user_facebook=text if len(text) >= 3 else None)
                 continue
 
             log.info(f"OCR image_url: {img_url}")
 
-            # gọi OCR nhanh (timeout trong ocr_fast)
+            # gọi OCR nhanh
             try:
                 result = fast_extract_amount_date_actor_detail(img_url, timeout=30)
             except Exception as e:
@@ -382,42 +364,35 @@ def webhook_receive():
             lines      = result.get("lines") or []
             spent      = float(result.get("spent") or 0.0)
 
-            # bóc dd/mm/yyyy từ when_txt
-            day_month_year = parse_ddmmyyyy_from_text(when_txt)
+            # bóc dd/mm/yyyy
+            dmy = parse_ddmmyyyy_from_text(when_txt)
             month_year_str = "-"
             cond_date = False
-            if day_month_year:
-                d_, m_, y_ = day_month_year
+            if dmy:
+                d_, m_, y_ = dmy
                 month_year_str = f"{d_:02d}/{m_:02d}/{y_:04d}"
                 cond_date = is_current_month_vn(d_, m_, y_)
 
-            # lấy dòng CSV cho PSID
+            # lấy dòng CSV của PSID, nếu thiếu thì tạo
             rows2 = load_psids_csv()
             target_idx = None
             for i, r in enumerate(rows2):
                 if r.get("psid") == psid:
                     target_idx = i
                     break
-            # nếu chưa có thì thêm mới
             if target_idx is None:
                 ensure_psid_row(psid)
+                rows2 = load_psids_csv()
+                for i, r in enumerate(rows2):
+                    if r.get("psid") == psid:
+                        target_idx = i
+                        break
 
-            # CHỈ dùng user_momo để so tên
-            csv_fb_now = ""
-            csv_momo_now = ""
-            row_ok = False
-            # làm lại sau ensure_psid_row
-            rows2 = load_psids_csv()
-            for i, r in enumerate(rows2):
-                if r.get("psid") == psid:
-                    row_ok = True
-                    target_idx = i
-                    csv_fb_now = (r.get("user_facebook") or "").strip()
-                    csv_momo_now = (r.get("user_momo") or "").strip()
-                    break
+            csv_fb_now = rows2[target_idx].get("user_facebook", "").strip() if target_idx is not None else ""
+            csv_momo_now = rows2[target_idx].get("user_momo", "").strip() if target_idx is not None else ""
 
-            # nếu OCR có actor và CSV chưa có user_facebook -> điền để tiện theo dõi (KHÔNG dùng cho auto-mute)
-            if row_ok and actor != "-" and not csv_fb_now:
+            # nếu OCR có actor và CSV trống user_facebook -> lưu tham khảo (không dùng auto-mute)
+            if target_idx is not None and actor != "-" and not csv_fb_now:
                 rows2[target_idx]["user_facebook"] = actor
                 try:
                     save_psids_csv(rows2, commit_msg=f"fill user_facebook for {psid} from OCR")
@@ -428,19 +403,11 @@ def webhook_receive():
             cond_amount = (amount_val == 120000)
             cond_name   = bool(csv_momo_now and actor != "-" and names_match(csv_momo_now, actor))
 
-            # similarity để in debug
+            # similarity để in %
             name_sim = None
             if csv_momo_now and actor != "-":
                 try:
-                    a = norm_name(csv_momo_now); b = norm_name(actor)
-                    sims = [
-                        fuzz.ratio(a, b),
-                        fuzz.partial_ratio(a, b),
-                        fuzz.token_set_ratio(a, b),
-                        fuzz.token_sort_ratio(a, b),
-                        int(100 * Levenshtein.normalized_similarity(a, b)),
-                    ]
-                    name_sim = max(sims)
+                    name_sim = int(round(char_similarity(csv_momo_now, actor) * 100))
                 except Exception:
                     name_sim = None
 
@@ -448,7 +415,6 @@ def webhook_receive():
             date_ok   = cond_date
             name_ok   = cond_name
 
-            # đủ 3 điều kiện => mute tới đầu tháng sau (cập nhật last_paid_month = YYYY-MM hiện tại)
             mute_ok = False
             if amount_ok and date_ok and name_ok:
                 now_vn = dt.datetime.now(dt.timezone.utc).astimezone(VN_TZ)
@@ -459,33 +425,29 @@ def webhook_receive():
                 except Exception as e:
                     log.exception(f"update_last_paid_month failed: {e}")
 
-            when_txt_display = when_txt
+            # trả kết quả + checklist + debug
             reply = (
                 "✅ KẾT QUẢ (MoMo)\n"
                 f"• Số tiền: {amt_text}\n"
-                f"• Thời gian: {when_txt_display}\n"
+                f"• Thời gian: {when_txt}\n"
                 f"• Người thực hiện: {actor}\n"
                 f"• Chi tiết: {detail}\n"
                 f"(OCR ~{spent:.2f}s)\n\n"
-                "📋 Checklist (đối chiếu với user_momo):\n"
-                + "\n".join("• " + line for line in [
-                    f"{ok(row_ok)} Có dòng CSV cho PSID",
-                    f"{ok(bool(csv_momo_now))} Có user_momo trong CSV (MoMo='{csv_momo_now or '-'}')",
-                    f"{ok(name_ok)} Tên khớp user_momo ↔ OCR: '{csv_momo_now or '-'}' ~ '{actor}'"
-                    + (f" (similarity≈{name_sim}%)" if name_sim is not None else ""),
-                    f"{ok(amount_ok)} Số tiền = 120.000đ (OCR: {amt_text})",
-                    f"{ok(date_ok)} Ngày thuộc tháng hiện tại (OCR: {month_year_str})",
-                    f"{ok(mute_ok)} Đã đặt tắt nhắc tới đầu tháng sau",
-                ])
+                "📋 Checklist (đối chiếu với user_momo trong CSV):\n"
+                f"• {ok(target_idx is not None)} Có dòng CSV cho PSID\n"
+                f"• {ok(bool(csv_momo_now))} Có user_momo trong CSV (MoMo='{csv_momo_now or '-'}')\n"
+                f"• {ok(name_ok)} Tên khớp user_momo ↔ OCR: '{csv_momo_now or '-'}' ~ '{actor}'"
+                + (f" (similarity≈{name_sim}%)" if name_sim is not None else "") + "\n"
+                f"• {ok(amount_ok)} Số tiền = 120.000đ (OCR: {amt_text})\n"
+                f"• {ok(date_ok)} Ngày thuộc tháng hiện tại (OCR: {month_year_str})\n"
+                f"• {ok(mute_ok)} Đã đặt tắt nhắc tới đầu tháng sau"
             )
 
-            # kèm debug lines OCR để bạn theo dõi
             if lines:
-                preview = lines[:30]  # tránh quá dài
+                preview = lines[:30]
                 body = "\n".join(preview)
-                reply += f"\n\n[DEBUG] OCR lines ({len(lines)}):\n" + body
+                reply += f"\n\n[DEBUG] OCR lines ({len(lines)}):\n{body}"
 
-            # gửi kết quả
             try:
                 send_text(psid, reply)
             except Exception as e:
@@ -493,7 +455,7 @@ def webhook_receive():
 
     return "ok", 200
 
-# 3) Endpoint cron gửi hằng tuần (tôn trọng last_paid_month)
+# 3) Cron gửi nhắc hằng tuần (tôn trọng last_paid_month)
 @app.post("/task/weekly")
 def task_weekly():
     if request.headers.get("X-CRON-SECRET") != CRON_SECRET:
@@ -501,12 +463,10 @@ def task_weekly():
     if not PAGE_TOKEN:
         return jsonify({"error": "PAGE_TOKEN is missing"}), 500
 
-    # Cho phép override psids= và msg=
-    psids_param = request.args.get("psids")  # "111,222"
+    psids_param = request.args.get("psids")
     custom_msg  = request.args.get("msg")
 
-    # Lấy danh sách mục tiêu
-    targets = []
+    targets: List[str] = []
     mode = "CSV"
     rows = load_psids_csv()
     now_vn = dt.datetime.now(dt.timezone.utc).astimezone(VN_TZ)
@@ -516,13 +476,12 @@ def task_weekly():
         mode = "psids"
         targets = [p.strip() for p in psids_param.split(",") if p.strip()]
     elif rows:
-        # bỏ qua ai đã last_paid_month == current_yyyymm
         for r in rows:
             psid = (r.get("psid") or "").strip()
             if not psid:
                 continue
             if (r.get("last_paid_month") or "") == current_yyyymm:
-                continue  # đã trả trong tháng
+                continue
             targets.append(psid)
     else:
         mode = "TEST_PSIDS"
@@ -549,5 +508,4 @@ def task_weekly():
 
 # ====== MAIN ======
 if __name__ == "__main__":
-    # khi chạy local: python server.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
