@@ -499,16 +499,6 @@ def webhook_receive():
                         f"• Người thực hiện: {actor}\n"
                         f"• Chi tiết: {detail}\n"
                         f"(OCR ~{spent}s)\n\n"
-                        "📋 Checklist:\n"
-                        + "\n".join("• " + line for line in [
-                            f"{ok(row_ok)} Có dòng CSV cho PSID",
-                            f"{ok(bool(csv_fb_now or csv_momo_now))} Có tên CSV "
-                            f"(FB='{csv_fb_now or '-'}', MoMo='{csv_momo_now or '-'}')",
-                            f"{ok(name_ok)} Tên khớp CSV↔OCR: '{csv_name_now or '-'}' ~ OCR='{actor}'",
-                            f"{ok(amount_ok)} Số tiền = 120.000đ (OCR: {amt_text})",
-                            f"{ok(date_ok)} Ngày thuộc tháng hiện tại (VN) (OCR: {when_txt_display} ~ {month_year_str})",
-                            f"{ok(mute_ok)} Đã đặt tắt nhắc (mute) tới đầu tháng sau",
-                        ])
                     )
                     if not mute_ok:
                         reply += "\n\nℹ️ Chưa đủ điều kiện dừng nhắc (cần đúng tên, 120.000đ, và tháng hiện tại)."
