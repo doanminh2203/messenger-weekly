@@ -31,7 +31,7 @@ VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "changeme")
 CRON_SECRET     = os.getenv("CRON_SECRET", "secret")
 
 # CSV: đọc (raw URL) và ghi (GitHub API)
-PSIDS_CSV_URL   = os.getenv("PSIDS_CSV_URL", "")  # vd: https://raw.githubusercontent.com/<owner>/<repo>/main/psids.csv
+PSIDS_CSV_URL   = os.getenv("PSIDS_CSV_URL", "")
 GH_OWNER        = os.getenv("GH_OWNER", "")
 GH_REPO         = os.getenv("GH_REPO", "")
 GH_BRANCH       = os.getenv("GH_BRANCH", "main")
@@ -107,12 +107,12 @@ def extract_momo_date(lines: List[str], fallback_text: str) -> Tuple[str, Option
             hit = extract_strict_slash_date_from_text(ln)
             if hit:
                 return hit[0], hit[1]
-    # sau đó quét tất cả dòng
+    # quét tất cả dòng
     for ln in lines or []:
         hit = extract_strict_slash_date_from_text(ln)
         if hit:
             return hit[0], hit[1]
-    # fallback: text tổng hợp như "22:25-22/09/2025"
+    # fallback: text tổng hợp
     hit = extract_strict_slash_date_from_text(fallback_text or "")
     if hit:
         return hit[0], hit[1]
@@ -241,18 +241,34 @@ def parse_amount_to_int(amount_text: Optional[str]) -> Optional[int]:
     digits = re.sub(r"[^\d]", "", amount_text)
     return int(digits) if digits.isdigit() else None
 
-# ================= Dedup message =================
-_recent_mids: Dict[str, float] = {}
-def seen_mid(mid: str, ttl_sec: int = 600) -> bool:
+# ================= Strong de-dup (mid + image_url) =================
+_processed_mids: Dict[str, float] = {}
+_processed_images: Dict[str, float] = {}
+DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "7200"))  # 2h mặc định
+
+def _gc_dedup():
     now = time.time()
-    for k, v in list(_recent_mids.items()):
-        if now - v > ttl_sec:
-            _recent_mids.pop(k, None)
+    for d in (_processed_mids, _processed_images):
+        for k, ts in list(d.items()):
+            if now - ts > DEDUP_TTL_SEC:
+                d.pop(k, None)
+
+def seen_mid(mid: Optional[str]) -> bool:
     if not mid:
         return False
-    if mid in _recent_mids:
+    _gc_dedup()
+    if mid in _processed_mids:
         return True
-    _recent_mids[mid] = now
+    _processed_mids[mid] = time.time()
+    return False
+
+def seen_image(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    _gc_dedup()
+    if url in _processed_images:
+        return True
+    _processed_images[url] = time.time()
     return False
 
 # ================= Routes =================
@@ -289,16 +305,19 @@ def webhook_receive():
             if not psid:
                 continue
 
+            # bỏ qua delivery/read events
+            if evt.get("delivery") or evt.get("read"):
+                continue
+
             mid = ((evt.get("message") or {}).get("mid")) or ((evt.get("postback") or {}).get("mid"))
             if mid and seen_mid(mid):
-                app.logger.info("Skip duplicate mid=%s", mid)
+                app.logger.info("Skip duplicate by mid=%s", mid)
                 continue
 
             # GET_STARTED
             if evt.get("postback", {}).get("payload") == "GET_STARTED":
                 send_text(psid,
                     "Chào bạn! Gửi ảnh biên lai MoMo để hệ thống kiểm tra và tự dừng nhắc khi đã đóng 120.000đ trong tháng.")
-                # đảm bảo có dòng CSV + điền tên FB nếu trống
                 rows = load_psids_csv()
                 rows = upsert_row_by_psid(rows, psid, fb_name="")
                 idx = next((i for i, r in enumerate(rows) if r.get("psid") == psid), None)
@@ -332,8 +351,9 @@ def webhook_receive():
                 else:
                     save_psids_csv(rows, commit_msg="upsert psid on message")
 
-            # Xử lý ảnh
+            # Xử lý ảnh: CHỈ 1 ảnh đầu tiên, và chống trùng theo URL
             atts: List[Dict] = msg.get("attachments") or []
+            processed_one = False
             for att in atts:
                 if att.get("type") != "image":
                     continue
@@ -341,10 +361,24 @@ def webhook_receive():
                 if not image_url:
                     continue
 
+                # nếu lần đầu thấy mid thì đánh dấu mid; nếu không có mid thì chống trùng theo url
+                if mid:
+                    # mid đã được seen_mid ở trên (để skip sớm). ở đây chỉ đánh dấu lần nữa để chắc chắn
+                    _processed_mids[mid] = time.time()
+                else:
+                    if seen_image(image_url):
+                        app.logger.info("Skip duplicate by image_url=%s", image_url)
+                        continue
+
+                # Đã xử lý 1 ảnh rồi thì dừng (tránh gửi nhiều lần nếu có nhiều image trong cùng message)
+                if processed_one:
+                    break
+
                 if fast_extract_amount_date is None:
                     app.logger.error("OCR module not available: %s", _OCR_IMPORT_ERR)
                     send_text(psid, "❌ OCR chưa sẵn sàng trên server.")
-                    continue
+                    processed_one = True
+                    break
 
                 app.logger.info("OCR image_url: %s", image_url)
                 try:
@@ -374,7 +408,27 @@ def webhook_receive():
                         app.logger.exception("Set-name-after-OCR failed: %s", e)
 
                     # ---- ngày MoMo dd/mm/yyyy (slash only) ----
-                    date_text_strict, month_year = extract_momo_date(lines, when_txt)
+                    def extract_strict_date_anywhere(lines_local: List[str], fallback: str):
+                        # ưu tiên dòng chứa từ khóa thời gian
+                        for ln in lines_local or []:
+                            if re.search(r"\b(thoi\s*gia[mn]|thời\s*gia[mn])\b", ln, flags=re.I):
+                                hit = extract_strict_slash_date_from_text(ln)
+                                if hit:
+                                    return hit
+                        # sau đó thử toàn bộ
+                        for ln in lines_local or []:
+                            hit = extract_strict_slash_date_from_text(ln)
+                            if hit:
+                                return hit
+                        # fallback
+                        return extract_strict_slash_date_from_text(fallback or "")
+
+                    hit = extract_strict_date_anywhere(lines, when_txt)
+                    if hit:
+                        date_text_strict, month_year = hit[0], hit[1]
+                    else:
+                        date_text_strict, month_year = "-", None
+
                     when_txt_display = when_txt or date_text_strict or "-"
 
                     # điều kiện auto-mute
@@ -384,7 +438,7 @@ def webhook_receive():
 
                     rows2 = load_psids_csv()
 
-                    # Tìm dòng ứng viên theo PSID trước
+                    # Tìm dòng ứng viên theo PSID
                     target_idx = next((i for i, r in enumerate(rows2) if r.get("psid") == psid), None)
 
                     # Lấy tên tham chiếu để so khớp: ưu tiên user_momo, fallback user_facebook
@@ -468,10 +522,16 @@ def webhook_receive():
                     reply += f"\n\n[DEBUG] OCR lines ({len(lines)}):\n{preview_lines}"
 
                     send_text(psid, reply)
+                    processed_one = True
+                    # đánh dấu image_url đã xử lý để retry cùng URL không lặp
+                    _processed_images[image_url] = time.time()
+                    break  # chỉ xử lý ảnh đầu tiên
 
                 except Exception as e:
                     app.logger.exception("OCR failed: %s", e)
                     send_text(psid, "❌ Xin lỗi, không đọc được ảnh này. Bạn thử chụp rõ hơn/đủ sáng nhé.")
+                    processed_one = True
+                    break
 
             # Text “DỪNG” để mute tới đầu tháng sau
             t = (text_in or "").strip().lower()
