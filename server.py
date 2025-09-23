@@ -15,12 +15,12 @@ from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
-# -------- OCR nhanh (yêu cầu file ocr_fast.py trong repo) ----------
+# ---- OCR nhanh (yêu cầu ocr_fast.py trong repo) ----
 try:
-    # trả về dict: {amount_text, date_text, actor_name, detail_text, lines, spent_sec}
+    # phải trả về dict: {amount_text, date_text, actor_name, detail_text, lines, spent_sec}
     from ocr_fast import fast_extract_amount_date
 except Exception as e:
-    fast_extract_amount_date = None  # sẽ báo lỗi khi gọi
+    fast_extract_amount_date = None
     _OCR_IMPORT_ERR = e
 
 # ================= ENV =================
@@ -39,7 +39,7 @@ GH_FILE_PATH    = os.getenv("GH_FILE_PATH", "psids.csv")
 GH_TOKEN        = os.getenv("GH_TOKEN", "")
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-CSV_HEADERS = ["psid", "name", "mute_until", "created_at_iso"]
+CSV_HEADERS = ["psid", "user_facebook", "user_momo", "mute_until", "created_at_iso"]
 
 # ================= APP & LOG =================
 app = Flask(__name__)
@@ -62,7 +62,6 @@ def send_text(psid: str, text: str):
         app.logger.error("Send API error %s: %s", r.status_code, r.text)
     r.raise_for_status()
 
-# (tuỳ chọn) lấy tên hiển thị FB (first/last) nếu cần tự động điền name khi CSV trống
 def get_user_profile(psid: str) -> Optional[dict]:
     if not PAGE_TOKEN:
         return None
@@ -86,43 +85,34 @@ def get_display_name(profile: Optional[dict]) -> str:
     return f"{first} {last}".strip()
 
 # ================= Date helpers (strict dd/mm/yyyy with slash) =================
-SLASH_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")  # chỉ dd/mm/yyyy
+SLASH_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
 
 def extract_strict_slash_date_from_text(text: str) -> Optional[Tuple[str, Tuple[int, int]]]:
-    """
-    Trả về (date_text, (month, year)) nếu tìm thấy dd/mm/yyyy với dấu '/'; ngược lại None.
-    """
     if not text:
         return None
     m = SLASH_DATE_RE.search(text)
     if not m:
         return None
-    d, mth, y = m.groups()
+    _d, mth, y = m.groups()
     month = int(mth)
     year = int(y)
-    # kiểm tra hợp lệ sơ bộ
     if not (1 <= month <= 12 and 2000 <= year <= 2100):
         return None
     return (m.group(0), (month, year))
 
 def extract_momo_date(lines: List[str], fallback_text: str) -> Tuple[str, Optional[Tuple[int,int]]]:
-    """
-    Quét toàn bộ lines OCR để tìm dd/mm/yyyy (slash). 
-    Ưu tiên dòng chứa cả 'Thoi gian'/'Thời gian'; nếu không có thì tìm bất kỳ.
-    Nếu vẫn không thấy, thử lấy từ fallback_text (ví dụ '22:25-22/09/2025').
-    """
-    # ưu tiên dòng chứa từ khóa
+    # ưu tiên dòng chứa "Thời gian/Thoi gian"
     for ln in lines or []:
         if re.search(r"\b(thoi\s*gia[mn]|thời\s*gia[mn])\b", ln, flags=re.I):
             hit = extract_strict_slash_date_from_text(ln)
             if hit:
                 return hit[0], hit[1]
-    # quét tất cả dòng
+    # sau đó quét tất cả dòng
     for ln in lines or []:
         hit = extract_strict_slash_date_from_text(ln)
         if hit:
             return hit[0], hit[1]
-    # fallback: text tổng hợp (ví dụ '22:25-22/09/2025' → vẫn sẽ match '22/09/2025')
+    # fallback: text tổng hợp như "22:25-22/09/2025"
     hit = extract_strict_slash_date_from_text(fallback_text or "")
     if hit:
         return hit[0], hit[1]
@@ -186,7 +176,8 @@ def save_psids_csv(rows: List[Dict[str, str]], commit_msg: str) -> bool:
     for r in rows:
         writer.writerow({
             "psid": r.get("psid", "").strip(),
-            "name": r.get("name", "").strip(),
+            "user_facebook": r.get("user_facebook", "").strip(),
+            "user_momo": r.get("user_momo", "").strip(),
             "mute_until": r.get("mute_until", "").strip(),
             "created_at_iso": r.get("created_at_iso", "").strip(),
         })
@@ -204,18 +195,19 @@ def save_psids_csv(rows: List[Dict[str, str]], commit_msg: str) -> bool:
         return False
     return True
 
-def upsert_row_by_psid(rows: List[Dict[str, str]], psid: str, name: str) -> List[Dict[str, str]]:
+def upsert_row_by_psid(rows: List[Dict[str, str]], psid: str, fb_name: str) -> List[Dict[str, str]]:
     found = False
     for r in rows:
         if r.get("psid") == psid:
             found = True
-            if not (r.get("name") or "").strip() and name:
-                r["name"] = name
+            if not (r.get("user_facebook") or "").strip() and fb_name:
+                r["user_facebook"] = fb_name
             break
     if not found:
         rows.append({
             "psid": psid,
-            "name": name or "",
+            "user_facebook": fb_name or "",
+            "user_momo": "",
             "mute_until": "",
             "created_at_iso": dt.datetime.now(VN_TZ).isoformat(timespec="seconds"),
         })
@@ -306,39 +298,38 @@ def webhook_receive():
             if evt.get("postback", {}).get("payload") == "GET_STARTED":
                 send_text(psid,
                     "Chào bạn! Gửi ảnh biên lai MoMo để hệ thống kiểm tra và tự dừng nhắc khi đã đóng 120.000đ trong tháng.")
-                # đảm bảo có dòng CSV
+                # đảm bảo có dòng CSV + điền tên FB nếu trống
                 rows = load_psids_csv()
-                rows = upsert_row_by_psid(rows, psid, name="")
-                # thử điền tên FB nếu trống
+                rows = upsert_row_by_psid(rows, psid, fb_name="")
                 idx = next((i for i, r in enumerate(rows) if r.get("psid") == psid), None)
-                if idx is not None and not (rows[idx].get("name") or "").strip():
+                if idx is not None and not (rows[idx].get("user_facebook") or "").strip():
                     prof = get_user_profile(psid)
                     disp = get_display_name(prof)
                     if disp:
-                        rows[idx]["name"] = disp
+                        rows[idx]["user_facebook"] = disp
                         if not rows[idx].get("created_at_iso"):
                             rows[idx]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
                         save_psids_csv(rows, commit_msg=f"set fb name for {psid} -> {disp}")
+                else:
+                    save_psids_csv(rows, commit_msg="upsert psid on get_started")
                 continue
 
             msg = evt.get("message") or {}
             text_in = (msg.get("text") or "").strip()
 
-            # Bảo đảm có dòng CSV cho PSID
+            # bảo đảm có dòng CSV cho PSID
             rows = load_psids_csv()
-            rows = upsert_row_by_psid(rows, psid, name="")
-            # nếu chưa có name → thử lấy từ FB
+            rows = upsert_row_by_psid(rows, psid, fb_name="")
             idx = next((i for i, r in enumerate(rows) if r.get("psid") == psid), None)
-            if idx is not None and not (rows[idx].get("name") or "").strip():
+            if idx is not None and not (rows[idx].get("user_facebook") or "").strip():
                 prof = get_user_profile(psid)
                 disp = get_display_name(prof)
                 if disp:
-                    rows[idx]["name"] = disp
+                    rows[idx]["user_facebook"] = disp
                     if not rows[idx].get("created_at_iso"):
                         rows[idx]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
                     save_psids_csv(rows, commit_msg=f"set fb name for {psid} -> {disp}")
                 else:
-                    # vẫn lưu upsert nếu chưa lưu
                     save_psids_csv(rows, commit_msg="upsert psid on message")
 
             # Xử lý ảnh
@@ -365,25 +356,24 @@ def webhook_receive():
                     detail   = result.get("detail_text") or "-"
                     spent    = result.get("spent_sec", 0.0)
 
-                    # log lines
                     app.logger.info("=== OCR LINES (%d) ===\n%s\n=== END OCR LINES ===",
                                     len(lines), "\n".join(lines))
 
-                    # nếu CSV name trống & OCR có actor -> set ngay
+                    # nếu CSV user_facebook trống & OCR có actor -> set ngay
                     try:
                         if actor and actor != "-":
                             rows_cur = load_psids_csv()
                             idx_psid = next((i for i, r in enumerate(rows_cur) if r.get("psid") == psid), None)
-                            if idx_psid is not None and not (rows_cur[idx_psid].get("name") or "").strip():
-                                rows_cur[idx_psid]["name"] = actor
+                            if idx_psid is not None and not (rows_cur[idx_psid].get("user_facebook") or "").strip():
+                                rows_cur[idx_psid]["user_facebook"] = actor
                                 if not rows_cur[idx_psid].get("created_at_iso"):
                                     rows_cur[idx_psid]["created_at_iso"] = dt.datetime.now(VN_TZ).isoformat(timespec="seconds")
-                                ok = save_psids_csv(rows_cur, commit_msg=f"set name for {psid} -> {actor}")
-                                app.logger.info("Set name from OCR for %s -> %s (saved=%s)", psid, actor, ok)
+                                ok = save_psids_csv(rows_cur, commit_msg=f"set user_facebook for {psid} -> {actor}")
+                                app.logger.info("Set user_facebook from OCR for %s -> %s (saved=%s)", psid, actor, ok)
                     except Exception as e:
                         app.logger.exception("Set-name-after-OCR failed: %s", e)
 
-                    # ---- dùng date strict dd/mm/yyyy (slash) ----
+                    # ---- ngày MoMo dd/mm/yyyy (slash only) ----
                     date_text_strict, month_year = extract_momo_date(lines, when_txt)
                     when_txt_display = when_txt or date_text_strict or "-"
 
@@ -393,31 +383,21 @@ def webhook_receive():
                     mute_until_str = ""
 
                     rows2 = load_psids_csv()
+
+                    # Tìm dòng ứng viên theo PSID trước
+                    target_idx = next((i for i, r in enumerate(rows2) if r.get("psid") == psid), None)
+
+                    # Lấy tên tham chiếu để so khớp: ưu tiên user_momo, fallback user_facebook
                     csv_name = ""
-                    # ưu tiên đúng PSID có name
-                    target_idx = None
-                    for idx2, r in enumerate(rows2):
-                        if r.get("psid") == psid and (r.get("name") or "").strip():
-                            csv_name = r.get("name").strip()
-                            if names_match(csv_name, actor):
-                                target_idx = idx2
-                                break
-                    # nếu PSID chưa có name → thử match theo tên trong CSV
-                    if target_idx is None:
-                        for idx2, r in enumerate(rows2):
-                            nm = (r.get("name") or "").strip()
-                            if nm and names_match(nm, actor):
-                                csv_name = nm
-                                target_idx = idx2
-                                break
-                    # nếu vẫn None → gán name vào dòng của PSID hiện tại
-                    if target_idx is None:
-                        for idx2, r in enumerate(rows2):
-                            if r.get("psid") == psid:
-                                rows2[idx2]["name"] = actor
-                                csv_name = actor
-                                target_idx = idx2
-                                break
+                    if target_idx is not None:
+                        row = rows2[target_idx]
+                        csv_name = (row.get("user_momo") or "").strip() or (row.get("user_facebook") or "").strip()
+
+                    # Nếu PSID chưa có tên & actor có => set vào user_facebook
+                    if target_idx is not None and actor and actor != "-" and not csv_name:
+                        rows2[target_idx]["user_facebook"] = actor
+                        save_psids_csv(rows2, commit_msg=f"fill fb name for {psid} from OCR")
+                        csv_name = actor
 
                     cond_amount = (amount_val == 120000)
                     cond_date   = bool(month_year and is_current_month_vn(*month_year))
@@ -437,21 +417,23 @@ def webhook_receive():
                         return "✅" if v else "❌"
 
                     month_year_str = f"{month_year[0]:02d}/{month_year[1]}" if month_year else "-"
-                    # lấy lại name hiện tại trong CSV cho checklist
+
+                    # lấy lại dòng CSV hiện tại cho checklist
                     rows_csv = load_psids_csv()
                     row_ok = False
-                    csv_name_now = ""
+                    csv_fb_now = ""
+                    csv_momo_now = ""
                     for r in rows_csv:
                         if r.get("psid") == psid:
                             row_ok = True
-                            csv_name_now = (r.get("name") or "").strip()
+                            csv_fb_now = (r.get("user_facebook") or "").strip()
+                            csv_momo_now = (r.get("user_momo") or "").strip()
                             break
-
+                    csv_name_now = csv_momo_now or csv_fb_now
                     try:
                         name_ok = bool(csv_name_now and actor and names_match(csv_name_now, actor))
                     except Exception:
                         name_ok = bool(csv_name_now and actor and (csv_name_now.strip().lower() == actor.strip().lower()))
-
                     amount_ok = cond_amount
                     date_ok   = cond_date
                     mute_ok   = bool(did_mute)
@@ -466,8 +448,9 @@ def webhook_receive():
                         "📋 Checklist:\n"
                         + "\n".join("• " + line for line in [
                             f"{ok(row_ok)} Có dòng CSV cho PSID",
-                            f"{ok(bool(csv_name_now))} Có tên trong CSV: {(csv_name_now or '-')}",
-                            f"{ok(name_ok)} Tên khớp CSV↔OCR: CSV='{csv_name_now or '-'}' ~ OCR='{actor}'",
+                            f"{ok(bool(csv_fb_now or csv_momo_now))} Có tên CSV "
+                            f"(FB='{csv_fb_now or '-'}', MoMo='{csv_momo_now or '-'}')",
+                            f"{ok(name_ok)} Tên khớp CSV↔OCR: '{csv_name_now or '-'}' ~ OCR='{actor}'",
                             f"{ok(amount_ok)} Số tiền = 120.000đ (OCR: {amt_text})",
                             f"{ok(date_ok)} Ngày thuộc tháng hiện tại (VN) (OCR: {when_txt_display} ~ {month_year_str})",
                             f"{ok(mute_ok)} Đã đặt tắt nhắc (mute) tới đầu tháng sau",
@@ -478,7 +461,7 @@ def webhook_receive():
                     else:
                         reply += f"\n\n🔕 Đã dừng nhắc đến {mute_until_str}."
 
-                    # debug lines (rút gọn)
+                    # debug lines (giới hạn ~20 dòng)
                     preview_lines = "\n".join(lines[:20])
                     if len(preview_lines) > 1200:
                         preview_lines = preview_lines[:1200] + "…"
@@ -494,7 +477,7 @@ def webhook_receive():
             t = (text_in or "").strip().lower()
             if t in {"dung", "dừng", "stop"}:
                 rows = load_psids_csv()
-                rows = upsert_row_by_psid(rows, psid, name="")
+                rows = upsert_row_by_psid(rows, psid, fb_name="")
                 next1 = _first_day_next_month_vn()
                 for r in rows:
                     if r.get("psid") == psid:
