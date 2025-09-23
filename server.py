@@ -17,7 +17,8 @@ from zoneinfo import ZoneInfo
 
 # -------- OCR nhanh (yêu cầu file ocr_fast.py trong repo) ----------
 try:
-    from ocr_fast import fast_extract_amount_date  # trả về dict: amount_text, date_text, actor_name, detail_text, lines, spent_sec
+    # trả về dict: {amount_text, date_text, actor_name, detail_text, lines, spent_sec}
+    from ocr_fast import fast_extract_amount_date
 except Exception as e:
     fast_extract_amount_date = None  # sẽ báo lỗi khi gọi
     _OCR_IMPORT_ERR = e
@@ -84,7 +85,49 @@ def get_display_name(profile: Optional[dict]) -> str:
     last  = (profile.get("last_name") or "").strip()
     return f"{first} {last}".strip()
 
-# ================= Date helpers =================
+# ================= Date helpers (strict dd/mm/yyyy with slash) =================
+SLASH_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")  # chỉ dd/mm/yyyy
+
+def extract_strict_slash_date_from_text(text: str) -> Optional[Tuple[str, Tuple[int, int]]]:
+    """
+    Trả về (date_text, (month, year)) nếu tìm thấy dd/mm/yyyy với dấu '/'; ngược lại None.
+    """
+    if not text:
+        return None
+    m = SLASH_DATE_RE.search(text)
+    if not m:
+        return None
+    d, mth, y = m.groups()
+    month = int(mth)
+    year = int(y)
+    # kiểm tra hợp lệ sơ bộ
+    if not (1 <= month <= 12 and 2000 <= year <= 2100):
+        return None
+    return (m.group(0), (month, year))
+
+def extract_momo_date(lines: List[str], fallback_text: str) -> Tuple[str, Optional[Tuple[int,int]]]:
+    """
+    Quét toàn bộ lines OCR để tìm dd/mm/yyyy (slash). 
+    Ưu tiên dòng chứa cả 'Thoi gian'/'Thời gian'; nếu không có thì tìm bất kỳ.
+    Nếu vẫn không thấy, thử lấy từ fallback_text (ví dụ '22:25-22/09/2025').
+    """
+    # ưu tiên dòng chứa từ khóa
+    for ln in lines or []:
+        if re.search(r"\b(thoi\s*gia[mn]|thời\s*gia[mn])\b", ln, flags=re.I):
+            hit = extract_strict_slash_date_from_text(ln)
+            if hit:
+                return hit[0], hit[1]
+    # quét tất cả dòng
+    for ln in lines or []:
+        hit = extract_strict_slash_date_from_text(ln)
+        if hit:
+            return hit[0], hit[1]
+    # fallback: text tổng hợp (ví dụ '22:25-22/09/2025' → vẫn sẽ match '22/09/2025')
+    hit = extract_strict_slash_date_from_text(fallback_text or "")
+    if hit:
+        return hit[0], hit[1]
+    return "-", None
+
 def _now_vn_date() -> dt.date:
     return dt.datetime.now(VN_TZ).date()
 
@@ -93,6 +136,10 @@ def _first_day_next_month_vn() -> dt.date:
     year = today.year + (1 if today.month == 12 else 0)
     month = 1 if today.month == 12 else today.month + 1
     return dt.date(year, month, 1)
+
+def is_current_month_vn(month: int, year: int) -> bool:
+    today = _now_vn_date()
+    return (month == today.month) and (year == today.year)
 
 # ================= CSV helpers (GitHub) =================
 def load_psids_csv() -> List[Dict[str, str]]:
@@ -174,7 +221,7 @@ def upsert_row_by_psid(rows: List[Dict[str, str]], psid: str, name: str) -> List
         })
     return rows
 
-# ================= Name/Amount/Date matching =================
+# ================= Name/Amount matching =================
 import unicodedata
 from rapidfuzz.fuzz import partial_ratio, ratio
 
@@ -201,28 +248,6 @@ def parse_amount_to_int(amount_text: Optional[str]) -> Optional[int]:
         return None
     digits = re.sub(r"[^\d]", "", amount_text)
     return int(digits) if digits.isdigit() else None
-
-DATE_PATTERNS = [
-    re.compile(r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})"),  # dd/mm/yyyy
-]
-
-def extract_month_year(text: Optional[str]) -> Optional[Tuple[int, int]]:
-    if not text:
-        return None
-    for pat in DATE_PATTERNS:
-        m = pat.search(text)
-        if m:
-            _, mth, y = m.groups()
-            month = int(mth)
-            year = int(y)
-            if year < 100:
-                year += 2000
-            return (month, year)
-    return None
-
-def is_current_month_vn(month: int, year: int) -> bool:
-    today = _now_vn_date()
-    return (month == today.month) and (year == today.year)
 
 # ================= Dedup message =================
 _recent_mids: Dict[str, float] = {}
@@ -358,9 +383,12 @@ def webhook_receive():
                     except Exception as e:
                         app.logger.exception("Set-name-after-OCR failed: %s", e)
 
+                    # ---- dùng date strict dd/mm/yyyy (slash) ----
+                    date_text_strict, month_year = extract_momo_date(lines, when_txt)
+                    when_txt_display = when_txt or date_text_strict or "-"
+
                     # điều kiện auto-mute
                     amount_val = parse_amount_to_int(amt_text)
-                    month_year = extract_month_year(when_txt)
                     did_mute = False
                     mute_until_str = ""
 
@@ -428,23 +456,22 @@ def webhook_receive():
                     date_ok   = cond_date
                     mute_ok   = bool(did_mute)
 
-                    check_lines = [
-                        f"{ok(row_ok)} Có dòng CSV cho PSID",
-                        f"{ok(bool(csv_name_now))} Có tên trong CSV: {(csv_name_now or '-')}",
-                        f"{ok(name_ok)} Tên khớp CSV↔OCR: CSV='{csv_name_now or '-'}' ~ OCR='{actor}'",
-                        f"{ok(amount_ok)} Số tiền = 120.000đ (OCR: {amt_text})",
-                        f"{ok(date_ok)} Ngày thuộc tháng hiện tại (VN) (OCR: {when_txt} ~ {month_year_str})",
-                        f"{ok(mute_ok)} Đã đặt tắt nhắc (mute) tới đầu tháng sau",
-                    ]
-
                     reply = (
                         "✅ KẾT QUẢ (MoMo)\n"
                         f"• Số tiền: {amt_text}\n"
-                        f"• Thời gian: {when_txt}\n"
+                        f"• Thời gian: {when_txt_display}\n"
                         f"• Người thực hiện: {actor}\n"
                         f"• Chi tiết: {detail}\n"
                         f"(OCR ~{spent}s)\n\n"
-                        "📋 Checklist:\n" + "\n".join("• " + line for line in check_lines)
+                        "📋 Checklist:\n"
+                        + "\n".join("• " + line for line in [
+                            f"{ok(row_ok)} Có dòng CSV cho PSID",
+                            f"{ok(bool(csv_name_now))} Có tên trong CSV: {(csv_name_now or '-')}",
+                            f"{ok(name_ok)} Tên khớp CSV↔OCR: CSV='{csv_name_now or '-'}' ~ OCR='{actor}'",
+                            f"{ok(amount_ok)} Số tiền = 120.000đ (OCR: {amt_text})",
+                            f"{ok(date_ok)} Ngày thuộc tháng hiện tại (VN) (OCR: {when_txt_display} ~ {month_year_str})",
+                            f"{ok(mute_ok)} Đã đặt tắt nhắc (mute) tới đầu tháng sau",
+                        ])
                     )
                     if not mute_ok:
                         reply += "\n\nℹ️ Chưa đủ điều kiện dừng nhắc (cần đúng tên, 120.000đ, và tháng hiện tại)."
